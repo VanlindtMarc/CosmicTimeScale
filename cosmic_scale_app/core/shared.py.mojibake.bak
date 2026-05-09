@@ -1,0 +1,565 @@
+﻿"""
+Cosmic Time Scale
+Transpose any event from a cosmic period onto a human-scale reference.
+Supports "X years ago", absolute date/time entry, and preset events.
+Multiple events displayed on a zoomable, pannable timeline.
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+import datetime
+import math
+
+AUTOSAVE_PATH = Path(__file__).resolve().parents[2] / "autosave.events"
+FILE_TYPES = [
+    ("Fichier d'Ã©vÃ¨nements", "*.events"),
+    ("JSON",                 "*.json"),
+    ("Tous fichiers",        "*.*"),
+]
+
+# â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR   = 3600
+SECONDS_PER_DAY    = 86_400
+# Display target uses an exact 365-day calendar year so fraction=1 lands on
+# "31 dÃ©c 23h59m59" rather than overflowing into a 366th day at 06h.
+SECONDS_PER_YEAR   = 365 * SECONDS_PER_DAY
+# Date math uses the Julian year (365.25 d) for accurate "years ago" conversions.
+ASTRO_YEAR_SECONDS = 365.25 * SECONDS_PER_DAY
+
+REFERENCE_PERIODS = {
+    "Big Bang â†’ aujourd'hui  (13,8 Ga)":              13_800_000_000,
+    "Formation de la Terre â†’ aujourd'hui  (4,54 Ga)":  4_540_000_000,
+    "Apparition de la vie â†’ aujourd'hui  (3,8 Ga)":    3_800_000_000,
+    "Ãˆre des dinosaures â†’ aujourd'hui  (252 Ma)":         252_000_000,
+    "Homo sapiens â†’ aujourd'hui  (300 000 ans)":              300_000,
+    "PersonnalisÃ©â€¦": None,
+}
+
+TARGET_SCALES = {
+    "1 jour  (24 h)":             SECONDS_PER_DAY,
+    "1 an  (365 j)":              SECONDS_PER_YEAR,
+    "1 siÃ¨cle  (100 ans)":        100  * SECONDS_PER_YEAR,
+    "1 millÃ©naire  (1 000 ans)":  1000 * SECONDS_PER_YEAR,
+    "1 heure":                    SECONDS_PER_HOUR,
+    "Temps reel (dates reelles)": "__REALTIME__",
+    "PersonnalisÃ©â€¦":              None,
+}
+
+MONTH_NAMES = ["jan", "fÃ©v", "mar", "avr", "mai", "jun",
+               "jul", "aoÃ»", "sep", "oct", "nov", "dÃ©c"]
+MONTH_NAMES_FULL = ["janvier", "fÃ©vrier", "mars", "avril", "mai", "juin",
+                    "juillet", "aoÃ»t", "septembre", "octobre", "novembre", "dÃ©cembre"]
+MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+PRESET_EVENTS = [
+    # (name, years_ago, description)
+    ("Big Bang",                          13_800_000_000,
+     "Ã‰vÃ¨nement initial Ã  l'origine de l'univers observable, marquant le dÃ©but "
+     "de l'expansion Ã  partir d'un Ã©tat extrÃªmement dense et chaud."),
+    ("Formation de la Voie LactÃ©e",       13_500_000_000,
+     "Notre galaxie s'est formÃ©e par effondrement gravitationnel et fusions "
+     "successives de proto-galaxies, Ã  partir de gaz primordial."),
+    ("Formation de la Terre",              4_540_000_000,
+     "AccrÃ©tion de planÃ©tÃ©simaux dans le disque protoplanÃ©taire solaire, "
+     "suivie d'une diffÃ©renciation en noyau, manteau et croÃ»te. La Lune se "
+     "forme peu aprÃ¨s suite Ã  un impact gÃ©ant (ThÃ©ia)."),
+    ("PremiÃ¨res bactÃ©ries",                3_800_000_000,
+     "Apparition des premiers organismes procaryotes anaÃ©robies dans les "
+     "ocÃ©ans primitifs (stromatolites les plus anciens connus)."),
+    ("PhotosynthÃ¨se oxygÃ©nique",           2_700_000_000,
+     "Les cyanobactÃ©ries dÃ©veloppent la photosynthÃ¨se Ã  oxygÃ¨ne, dÃ©clenchant "
+     "la Grande Oxydation et transformant l'atmosphÃ¨re terrestre."),
+    ("PremiÃ¨res cellules complexes",       2_100_000_000,
+     "Ã‰mergence des eucaryotes par endosymbiose entre cellules archÃ©es et "
+     "bactÃ©ries (mitochondries puis chloroplastes)."),
+    ("Multicellulaires",                   1_000_000_000,
+     "Apparition des premiers organismes multicellulaires, notamment les "
+     "algues rouges (fossile de Bangiomorpha)."),
+    ("Explosion cambrienne",                 541_000_000,
+     "Diversification rapide en quelques dizaines de millions d'annÃ©es des "
+     "grands groupes animaux Ã  parties dures fossilisables (trilobites, "
+     "brachiopodes, premiers chordÃ©s)."),
+    ("Premiers reptiles",                    310_000_000,
+     "Ã‰mergence des premiers amniotes terrestres au CarbonifÃ¨re (Hylonomus), "
+     "ancÃªtres des reptiles, oiseaux et mammifÃ¨res."),
+    ("Premiers dinosaures",                  230_000_000,
+     "Apparition au Trias supÃ©rieur des premiers dinosaures (Eoraptor, "
+     "Herrerasaurus) issus des archosaures."),
+    ("Premiers mammifÃ¨res",                  225_000_000,
+     "Petits animaux nocturnes issus des thÃ©rapsides cynodontes, "
+     "contemporains des premiers dinosaures."),
+    ("Extinction K-Pg (dinosaures)",          66_000_000,
+     "Impact d'un astÃ©roÃ¯de de ~10 km au YucatÃ¡n (cratÃ¨re de Chicxulub) "
+     "et trapps du Deccan provoquent la disparition des dinosaures non-aviens "
+     "et de ~75 % des espÃ¨ces."),
+    ("Premiers primates",                     55_000_000,
+     "Petits mammifÃ¨res arboricoles (Plesiadapiformes), ancÃªtres communs des "
+     "lÃ©muriens, singes et humains."),
+    ("Premiers grands singes",                20_000_000,
+     "Apparition des hominoÃ¯des en Afrique, ancÃªtres communs des gibbons, "
+     "orang-outans, gorilles, chimpanzÃ©s et humains."),
+    ("Australopithecus",                       4_000_000,
+     "HominidÃ©s bipÃ¨des d'Afrique de l'Est, dont la cÃ©lÃ¨bre 'Lucy' "
+     "(Australopithecus afarensis, ~3,2 Ma)."),
+    ("Homo habilis",                           2_400_000,
+     "Premier reprÃ©sentant du genre Homo, associÃ© Ã  la fabrication d'outils "
+     "en pierre taillÃ©e (industrie oldowayenne)."),
+    ("Homo erectus",                           1_900_000,
+     "Premier hominidÃ© Ã  coloniser l'Eurasie, maÃ®trisant le feu et "
+     "fabriquant des bifaces (industrie acheulÃ©enne)."),
+    ("Homo sapiens",                             300_000,
+     "Apparition de notre espÃ¨ce en Afrique (Jebel Irhoud, Maroc), capable "
+     "de pensÃ©e symbolique et de langage articulÃ©."),
+    ("PremiÃ¨res peintures rupestres",             40_000,
+     "Art pariÃ©tal du PalÃ©olithique supÃ©rieur (grotte Chauvet -36 ka, "
+     "Lascaux -17 ka, Altamira -14 ka)."),
+    ("Agriculture (nÃ©olithique)",                 12_000,
+     "Domestication des plantes (blÃ©, orge) et des animaux dans le Croissant "
+     "Fertile, dÃ©but de la sÃ©dentarisation et des villages."),
+    ("PremiÃ¨re Ã©criture (MÃ©sopotamie)",            5_200,
+     "Apparition de l'Ã©criture cunÃ©iforme Ã  Sumer (Uruk) pour la "
+     "comptabilitÃ© administrative et religieuse."),
+    ("Construction des pyramides",                 4_500,
+     "Ã‰dification des grandes pyramides d'Ã‰gypte (KhÃ©ops, KhÃ©phren, "
+     "MykÃ©rinos) sous l'Ancien Empire (IVe dynastie)."),
+    ("Naissance de JÃ©sus-Christ",                  2_026,
+     "Naissance estimÃ©e du fondateur du christianisme, point de rÃ©fÃ©rence "
+     "de l'Ã¨re chrÃ©tienne (Ã¨re commune)."),
+    ("RÃ©volution industrielle",                      250,
+     "Mutation Ã©conomique et sociale qui dÃ©bute en Grande-Bretagne, "
+     "marquÃ©e par la mÃ©canisation, la machine Ã  vapeur et l'industrie textile."),
+    ("PremiÃ¨re bombe atomique",                       81,
+     "Essai Trinity (16 juillet 1945) au Nouveau-Mexique, premier essai "
+     "d'une arme nuclÃ©aire Ã  fission (projet Manhattan)."),
+    ("Premier pas sur la Lune",                       57,
+     "Mission Apollo 11 (20 juillet 1969), Neil Armstrong devient le "
+     "premier humain Ã  marcher sur la Lune, suivi de Buzz Aldrin."),
+    ("Naissance d'Internet",                          35,
+     "Bascule officielle d'ARPANET vers les protocoles TCP/IP "
+     "(1er janvier 1983), point de dÃ©part de l'Internet moderne."),
+]
+
+PRESET_PERIODS = [
+    # (name, years_ago_start, years_ago_end, description)
+    ("HadÃ©en [Ã©on]",                  4_540_000_000, 4_000_000_000,
+     "Premier Ã©on de la Terre, marquÃ© par l'accrÃ©tion, la formation de la "
+     "Lune (impact de ThÃ©ia) et un ocÃ©an de magma. Aucune roche connue ne "
+     "subsiste de cette Ã©poque."),
+    ("ArchÃ©en [Ã©on]",                 4_000_000_000, 2_500_000_000,
+     "Refroidissement de la croÃ»te, formation des premiers continents et "
+     "des plus anciennes traces de vie (stromatolites bactÃ©riens)."),
+    ("ProtÃ©rozoÃ¯que [Ã©on]",           2_500_000_000,   541_000_000,
+     "Grande Oxydation de l'atmosphÃ¨re, premiÃ¨res cellules eucaryotes, "
+     "premiers multicellulaires (faune d'Ã‰diacara), supercontinents Rodinia "
+     "puis Pannotia."),
+    ("PalÃ©ozoÃ¯que [Ã¨re]",               541_000_000,   251_902_000,
+     "De l'explosion cambrienne Ã  la grande extinction permienne. "
+     "ConquÃªte des terres par les vÃ©gÃ©taux, arthropodes puis tÃ©trapodes."),
+    ("MÃ©sozoÃ¯que [Ã¨re]",                251_902_000,    66_000_000,
+     "Ãˆre des dinosaures. Formation de la PangÃ©e puis fragmentation, "
+     "apparition des oiseaux, des plantes Ã  fleurs et des mammifÃ¨res."),
+    ("CÃ©nozoÃ¯que [Ã¨re]",                 66_000_000,             0,
+     "Ãˆre des mammifÃ¨res et des oiseaux modernes. Refroidissement "
+     "progressif du climat, glaciations, apparition des hominidÃ©s."),
+    ("Cambrien [pÃ©riode]",              541_000_000,   485_400_000,
+     "PremiÃ¨re pÃ©riode du PalÃ©ozoÃ¯que, marquÃ©e par l'explosion cambrienne "
+     "et l'apparition de la plupart des phyla animaux modernes."),
+    ("Ordovicien [pÃ©riode]",            485_400_000,   443_800_000,
+     "Diversification massive des invertÃ©brÃ©s marins, premiÃ¨res plantes "
+     "terrestres. Se termine par la deuxiÃ¨me plus grande extinction de masse."),
+    ("Silurien [pÃ©riode]",              443_800_000,   419_200_000,
+     "Premiers poissons Ã  mÃ¢choires (gnathostomes), colonisation des terres "
+     "par des plantes vasculaires et arthropodes."),
+    ("DÃ©vonien [pÃ©riode]",              419_200_000,   358_900_000,
+     "Â« Ã‚ge des poissons Â», premiÃ¨res forÃªts (Archaeopteris), premiers "
+     "tÃ©trapodes (Tiktaalik, Ichthyostega), premiers insectes."),
+    ("CarbonifÃ¨re [pÃ©riode]",           358_900_000,   298_900_000,
+     "Vastes forÃªts marÃ©cageuses de fougÃ¨res et lÃ©pidodendrons Ã  l'origine "
+     "des gisements de charbon. Premiers reptiles, insectes gÃ©ants."),
+    ("Permien [pÃ©riode]",               298_900_000,   251_902_000,
+     "Formation de la PangÃ©e, climat aride, diversification des thÃ©rapsides. "
+     "Se termine par la plus grande extinction de masse de l'histoire (~95 %)."),
+    ("Trias [pÃ©riode]",                 251_902_000,   201_400_000,
+     "RÃ©cupÃ©ration aprÃ¨s l'extinction permienne, apparition des premiers "
+     "dinosaures, mammifÃ¨res et ptÃ©rosaures."),
+    ("Jurassique [pÃ©riode]",            201_400_000,   145_000_000,
+     "ApogÃ©e des dinosaures (Diplodocus, Allosaurus, Stegosaurus), "
+     "fragmentation de la PangÃ©e, apparition des oiseaux (Archaeopteryx)."),
+    ("CrÃ©tacÃ© [pÃ©riode]",               145_000_000,    66_000_000,
+     "Diversification maximale des dinosaures (T. rex, Triceratops), "
+     "apparition et expansion des plantes Ã  fleurs. Se termine par "
+     "l'extinction K-Pg."),
+    ("PalÃ©ogÃ¨ne [pÃ©riode]",              66_000_000,    23_030_000,
+     "Diversification rapide des mammifÃ¨res et des oiseaux aprÃ¨s la "
+     "disparition des dinosaures. Climat globalement chaud."),
+    ("NÃ©ogÃ¨ne [pÃ©riode]",                23_030_000,     2_580_000,
+     "Refroidissement global, expansion des prairies, apparition des "
+     "hominidÃ©s et de nombreux genres de mammifÃ¨res modernes."),
+    ("Quaternaire [pÃ©riode]",             2_580_000,             0,
+     "PÃ©riode actuelle, marquÃ©e par les cycles glaciaires et "
+     "l'expansion d'Homo sapiens."),
+    ("PlÃ©istocÃ¨ne [Ã©poque]",              2_580_000,        11_700,
+     "Glaciations alternÃ©es, mÃ©gafaune (mammouths, smilodons, ours des "
+     "cavernes), apparition d'Homo sapiens et extinction des autres Homo."),
+    ("HolocÃ¨ne [Ã©poque]",                    11_700,             0,
+     "PÃ©riode interglaciaire actuelle, dÃ©but de l'agriculture et des "
+     "civilisations humaines."),
+    ("AntiquitÃ©",                             5_026,         1_550,
+     "De l'invention de l'Ã©criture (~3000 av. J.-C.) Ã  la chute de "
+     "l'Empire romain d'Occident (476). Civilisations mÃ©sopotamiennes, "
+     "Ã©gyptiennes, grecques et romaines."),
+    ("Empire romain",                         2_053,         1_550,
+     "De l'avÃ¨nement d'Auguste (-27) Ã  la chute de Rome (476). ApogÃ©e "
+     "mÃ©diterranÃ©en, droit romain, langues latines."),
+    ("Moyen Ã‚ge",                             1_550,           534,
+     "PÃ©riode europÃ©enne s'Ã©tendant de la chute de Rome (476) Ã  la "
+     "dÃ©couverte de l'AmÃ©rique (1492). FÃ©odalitÃ©, christianisation, "
+     "dÃ©veloppement des citÃ©s."),
+    ("Renaissance",                             626,           426,
+     "Mouvement artistique et intellectuel europÃ©en (XVe-XVIe siÃ¨cles), "
+     "redÃ©couverte de l'AntiquitÃ©, humanisme, grandes dÃ©couvertes."),
+    ("Ã‰poque moderne",                          534,           237,
+     "De 1492 (AmÃ©riques) Ã  1789 (RÃ©volution franÃ§aise). Grandes "
+     "dÃ©couvertes, monarchies absolues, LumiÃ¨res."),
+    ("PremiÃ¨re Guerre mondiale",                112,           108,
+     "Conflit mondial 1914-1918, ~18 millions de morts. Fin des grands "
+     "empires europÃ©ens (austro-hongrois, ottoman, russe, allemand)."),
+    ("Seconde Guerre mondiale",                  87,            81,
+     "Conflit mondial 1939-1945, ~70 millions de morts. Shoah, dÃ©but de "
+     "l'Ã¨re nuclÃ©aire (Hiroshima, Nagasaki)."),
+]
+
+
+def format_period_summary(start: float, end: float) -> str:
+    duration = start - end
+    if duration >= 1e9: return f"il y a {start/1e9:.2f} â†’ {end/1e9:.2f} Ga"
+    if duration >= 1e6: return f"il y a {start/1e6:.1f} â†’ {end/1e6:.1f} Ma"
+    if duration >= 1e3: return f"il y a {start/1e3:.1f} â†’ {end/1e3:.1f} ka"
+    return f"il y a {start:.0f} â†’ {end:.0f} ans"
+
+
+EVENT_COLORS = [
+    "#58a6ff", "#f78166", "#3fb950", "#d2a8ff", "#ffa657",
+    "#79c0ff", "#ff7b72", "#56d364", "#bc8cff", "#ffb347",
+    "#39d353", "#e3b341", "#f0883e", "#a5d6ff", "#ffa8a8",
+]
+
+PALETTE = {
+    "bg":      "#0d1117",
+    "panel":   "#161b22",
+    "panel2":  "#1c2128",
+    "border":  "#30363d",
+    "accent":  "#58a6ff",
+    "accent2": "#f78166",
+    "text":    "#e6edf3",
+    "muted":   "#8b949e",
+    "success": "#3fb950",
+    "entry":   "#21262d",
+    "hover":   "#2d333b",
+}
+
+
+# â”€â”€ Data model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+@dataclass
+class CosmicEvent:
+    name: str
+    years_ago: float
+    color: str
+    description: str = ""
+    tag_names: list[str] = field(default_factory=lambda: ["general"])
+    fraction: float = 0.0
+    result_str: str = ""
+
+
+@dataclass
+class CosmicTag:
+    name: str
+    visible: bool = True
+    locked_visible: bool = False
+
+
+@dataclass
+class CosmicPeriod:
+    name: str
+    years_ago_start: float    # the older bound (further in the past)
+    years_ago_end:   float    # the more recent bound
+    color: str
+    description: str = ""
+    tag_names: list[str] = field(default_factory=lambda: ["general"])
+    fraction_start:  float = 0.0
+    fraction_end:    float = 0.0
+    start_str:       str   = ""
+    end_str:         str   = ""
+    duration_str:    str   = ""
+
+
+def format_duration_seconds(s: float) -> str:
+    """Pretty-print a duration in seconds at an appropriate unit."""
+    s = max(0.0, s)
+    if s >= SECONDS_PER_YEAR:    return f"{s / SECONDS_PER_YEAR:.2f} an"
+    if s >= 30 * SECONDS_PER_DAY: return f"{s / SECONDS_PER_DAY:.1f} j"
+    if s >= SECONDS_PER_DAY:     return f"{s / SECONDS_PER_DAY:.2f} j"
+    if s >= SECONDS_PER_HOUR:    return f"{s / SECONDS_PER_HOUR:.2f} h"
+    if s >= SECONDS_PER_MINUTE:  return f"{s / SECONDS_PER_MINUTE:.2f} min"
+    if s >= 1:                   return f"{s:.2f} s"
+    if s >= 1e-3:                return f"{s * 1000:.2f} ms"
+    return f"{s * 1e6:.2f} Âµs"
+
+
+# â”€â”€ Time helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def now_year_decimal() -> float:
+    now   = datetime.datetime.now()
+    start = datetime.datetime(now.year, 1, 1)
+    end   = datetime.datetime(now.year + 1, 1, 1)
+    return now.year + (now - start).total_seconds() / (end - start).total_seconds()
+
+
+def date_to_years_ago(year: int, month: int = 1, day: int = 1,
+                       hour: int = 0, minute: int = 0, second: int = 0) -> float:
+    if 1 <= year <= 9999:
+        try:
+            delta = datetime.datetime.now() - datetime.datetime(year, month, day, hour, minute, second)
+            return delta.total_seconds() / ASTRO_YEAR_SECONDS
+        except ValueError:
+            pass
+    event_decimal = year + (month - 1) / 12 + (day - 1) / 365.25
+    return now_year_decimal() - event_decimal
+
+
+def parse_years_ago(text: str) -> Optional[float]:
+    t = text.strip().lower().replace(",", ".").replace(" ", "")
+    multiplier = 1.0
+    for suffix, mult in [("ga", 1e9), ("ma", 1e6), ("ka", 1e3),
+                          ("milliard", 1e9), ("billion", 1e9),
+                          ("million", 1e6), ("mille", 1e3)]:
+        if t.endswith(suffix):
+            multiplier = mult
+            t = t[:-len(suffix)]
+            break
+    try:
+        return float(t) * multiplier
+    except ValueError:
+        return None
+
+
+def years_ago_to_datetime(years_ago: float) -> Optional[datetime.datetime]:
+    try:
+        return datetime.datetime.now() - datetime.timedelta(
+            seconds=years_ago * ASTRO_YEAR_SECONDS)
+    except OverflowError:
+        return None
+
+
+def format_calendar_year(year: int) -> str:
+    return f"{year:,}" if year >= 1 else f"{1 - year:,} av. J.-C."
+
+
+def approximate_calendar_year(years_ago: float) -> int:
+    return math.floor(now_year_decimal() - years_ago)
+
+
+def format_real_date_label(years_ago: float, step_sec: Optional[float] = None) -> str:
+    dt = years_ago_to_datetime(years_ago)
+    if dt is None:
+        year_label = format_calendar_year(approximate_calendar_year(years_ago))
+        if step_sec is not None and step_sec >= ASTRO_YEAR_SECONDS:
+            return year_label
+        return f"vers {year_label}"
+
+    short_date = f"{dt.day} {MONTH_NAMES[dt.month - 1]}"
+    if step_sec is None:
+        sec = dt.second + dt.microsecond / 1_000_000
+        return (f"Le {dt.day} {MONTH_NAMES_FULL[dt.month - 1]} {dt.year}\n"
+                f"a {dt.hour:02d}h {dt.minute:02d}min {sec:05.2f}s")
+    if step_sec >= 5 * ASTRO_YEAR_SECONDS:
+        return str(dt.year)
+    if step_sec >= 30 * SECONDS_PER_DAY:
+        return f"{MONTH_NAMES[dt.month - 1]}\n{dt.year}"
+    if step_sec >= SECONDS_PER_DAY:
+        return f"{short_date}\n{dt.year}"
+    if step_sec >= SECONDS_PER_HOUR:
+        return f"{short_date}\n{dt.hour:02d}h"
+    if step_sec >= SECONDS_PER_MINUTE:
+        return f"{short_date}\n{dt.hour:02d}:{dt.minute:02d}"
+    if step_sec >= 1:
+        return f"{short_date}\n{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+    sec = dt.second + dt.microsecond / 1_000_000
+    return f"{short_date}\n{dt.hour:02d}:{dt.minute:02d}:{sec:06.3f}"
+
+
+def fraction_to_position(frac: float, target_seconds: float) -> dict:
+    # Clamp just below the boundary so frac=1 reads as "23:59:59.999..." of the
+    # last unit instead of wrapping into the next period.
+    s             = max(0.0, min(frac * target_seconds, target_seconds - 1e-6))
+    day_of_year   = int(s / SECONDS_PER_DAY)
+    rem           = s - day_of_year * SECONDS_PER_DAY
+    hour          = int(rem // SECONDS_PER_HOUR);   rem -= hour * SECONDS_PER_HOUR
+    minute        = int(rem // SECONDS_PER_MINUTE); second = rem - minute * SECONDS_PER_MINUTE
+    d = day_of_year
+    month_idx = 11
+    for i, dm in enumerate(MONTH_DAYS):
+        if d < dm:
+            month_idx = i
+            break
+        d -= dm
+    else:
+        d = MONTH_DAYS[11] - 1
+    return dict(day_of_year=day_of_year + 1,
+                month_name=MONTH_NAMES_FULL[month_idx],
+                month_short=MONTH_NAMES[month_idx],
+                month_num=month_idx + 1,
+                day_of_month=d + 1,
+                hour=hour, minute=minute, second=second,
+                fraction=frac)
+
+
+def format_result(pos: dict, target_seconds: float,
+                  realtime_ref_years: Optional[float] = None) -> str:
+    pct = pos["fraction"] * 100
+    if realtime_ref_years is not None:
+        years_ago = max(0.0, realtime_ref_years * (1.0 - pos["fraction"]))
+        date_label = format_real_date_label(years_ago)
+        precision = 2 if years_ago < 10_000 else 0
+        return (f"{date_label}\n"
+                f"(il y a {years_ago:,.{precision}f} ans Ã‚Â· {pct:.4f}%)")
+
+    # â”€â”€ 1-year scale â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if abs(target_seconds - SECONDS_PER_YEAR) < 0.5:
+        return (f"Le {pos['day_of_month']} {pos['month_name']}\n"
+                f"Ã  {pos['hour']:02d}h {pos['minute']:02d}min {pos['second']:05.2f}s\n"
+                f"(jour {pos['day_of_year']} Â· {pct:.4f}%)")
+
+    # â”€â”€ 1-day scale â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if abs(target_seconds - SECONDS_PER_DAY) < 0.5:
+        ts = pos["fraction"] * SECONDS_PER_DAY
+        h  = int(ts // SECONDS_PER_HOUR);   ts -= h * SECONDS_PER_HOUR
+        m  = int(ts // SECONDS_PER_MINUTE); sc = ts - m * SECONDS_PER_MINUTE
+        return f"{h:02d}h {m:02d}min {sc:05.2f}s\n({pct:.4f}%)"
+
+    # â”€â”€ 1-hour scale â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if abs(target_seconds - SECONDS_PER_HOUR) < 0.5:
+        ts = pos["fraction"] * SECONDS_PER_HOUR
+        m  = int(ts // SECONDS_PER_MINUTE); sc = ts - m * SECONDS_PER_MINUTE
+        return f"{m}min {sc:05.2f}s\n({pct:.4f}%)"
+
+    # â”€â”€ Multi-year scales (siÃ¨cle, millÃ©naire, custom) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if target_seconds >= 1.5 * SECONDS_PER_YEAR:
+        s   = pos["fraction"] * target_seconds
+        yr  = int(s // SECONDS_PER_YEAR)
+        rem = s - yr * SECONDS_PER_YEAR
+        d   = int(rem // SECONDS_PER_DAY); rem -= d * SECONDS_PER_DAY
+        h   = int(rem // SECONDS_PER_HOUR); rem -= h * SECONDS_PER_HOUR
+        m   = int(rem // SECONDS_PER_MINUTE); sc = rem - m * SECONDS_PER_MINUTE
+        mi, dm = _month_day_from_day_of_year(min(d, 364))
+        return (f"An {yr+1}, le {dm+1} {MONTH_NAMES_FULL[mi]}\n"
+                f"Ã  {h:02d}h {m:02d}min {sc:05.2f}s\n"
+                f"(jour {d+1} de l'annÃ©e Â· {pct:.4f}%)")
+
+    # â”€â”€ Generic fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    ts   = pos["fraction"] * target_seconds
+    days = int(ts // SECONDS_PER_DAY);  ts -= days * SECONDS_PER_DAY
+    h    = int(ts // SECONDS_PER_HOUR); ts -= h * SECONDS_PER_HOUR
+    m    = int(ts // SECONDS_PER_MINUTE); sc = ts - m * SECONDS_PER_MINUTE
+    return f"Jour {days+1}  Â·  {h:02d}h {m:02d}min {sc:05.2f}s\n({pct:.4f}%)"
+
+
+# Tick steps in seconds, sorted ascending. Used to pick a "nice" interval at
+# any zoom level, from 1 ms up to 100 years.
+NICE_STEPS = [
+    0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
+    1, 2, 5, 10, 15, 30,
+    60, 120, 300, 600, 900, 1800,
+    3600, 7200, 10800, 21600, 43200,
+    86400, 2 * 86400, 7 * 86400,
+    30.4375 * 86400, 91.3125 * 86400, 182.625 * 86400,
+    365.25 * 86400, 10 * 365.25 * 86400, 100 * 365.25 * 86400,
+]
+
+
+def pick_tick_step(span_seconds: float, target_ticks: int = 8) -> float:
+    rough = span_seconds / max(1, target_ticks)
+    for s in NICE_STEPS:
+        if s >= rough:
+            return s
+    rough_years = max(1.0, rough / ASTRO_YEAR_SECONDS)
+    magnitude = 10 ** math.floor(math.log10(rough_years))
+    for factor in (1, 2, 5, 10):
+        candidate_years = factor * magnitude
+        if candidate_years >= rough_years:
+            return candidate_years * ASTRO_YEAR_SECONDS
+    return rough
+
+
+def _month_day_from_day_of_year(day_of_year: int) -> tuple[int, int]:
+    """Return (month_idx 0-11, day_in_month 0-based) from a 0-based day of year."""
+    d = day_of_year
+    for i, dm in enumerate(MONTH_DAYS):
+        if d < dm:
+            return i, d
+        d -= dm
+    return 11, MONTH_DAYS[11] - 1
+
+
+def format_axis_label(seconds: float, target_seconds: float, step_sec: float,
+                      realtime_ref_years: Optional[float] = None) -> str:
+    """Format a position on the timeline axis. May return a multi-line string."""
+    if realtime_ref_years is not None:
+        frac = 0.0 if target_seconds <= 0 else seconds / target_seconds
+        years_ago = max(0.0, realtime_ref_years * (1.0 - frac))
+        return format_real_date_label(years_ago, step_sec)
+    # â”€â”€ 1-year scale â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if abs(target_seconds - SECONDS_PER_YEAR) < 0.5:
+        d   = int(seconds // SECONDS_PER_DAY)
+        rem = seconds - d * SECONDS_PER_DAY
+        mi, dm = _month_day_from_day_of_year(d)
+        h   = int(rem // SECONDS_PER_HOUR);   rem -= h * SECONDS_PER_HOUR
+        m   = int(rem // SECONDS_PER_MINUTE); sc  = rem - m * SECONDS_PER_MINUTE
+        date = f"{dm+1} {MONTH_NAMES[mi]}"
+        if step_sec >= SECONDS_PER_DAY:    return date
+        if step_sec >= SECONDS_PER_HOUR:   return f"{date}\n{h:02d}h"
+        if step_sec >= 60:                 return f"{date}\n{h:02d}:{m:02d}"
+        if step_sec >= 1:                  return f"{date}\n{h:02d}:{m:02d}:{int(sc):02d}"
+        return f"{date}\n{h:02d}:{m:02d}:{sc:06.3f}"
+
+    # â”€â”€ 1-day scale â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if abs(target_seconds - SECONDS_PER_DAY) < 0.5:
+        h   = int(seconds // SECONDS_PER_HOUR);   rem = seconds - h * SECONDS_PER_HOUR
+        m   = int(rem // SECONDS_PER_MINUTE);     sc  = rem - m * SECONDS_PER_MINUTE
+        if step_sec >= SECONDS_PER_HOUR: return f"{h:02d}h"
+        if step_sec >= 60:               return f"{h:02d}:{m:02d}"
+        if step_sec >= 1:                return f"{h:02d}:{m:02d}:{int(sc):02d}"
+        return f"{h:02d}:{m:02d}:{sc:06.3f}"
+
+    # â”€â”€ 1-hour scale â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if abs(target_seconds - SECONDS_PER_HOUR) < 0.5:
+        m  = int(seconds // 60); sc = seconds - m * 60
+        if step_sec >= 60: return f"{m}min"
+        if step_sec >= 1:  return f"{m}min{int(sc):02d}s"
+        return f"{m}min{sc:06.3f}s"
+
+    # â”€â”€ Multi-year scales (century, millennium, custom multi-year) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if target_seconds >= 1.5 * SECONDS_PER_YEAR:
+        yr  = int(seconds // SECONDS_PER_YEAR)
+        rem = seconds - yr * SECONDS_PER_YEAR
+        d   = int(rem // SECONDS_PER_DAY)
+        mi, dm = _month_day_from_day_of_year(min(d, 364))
+        rem -= d * SECONDS_PER_DAY
+        h   = int(rem // SECONDS_PER_HOUR); rem -= h * SECONDS_PER_HOUR
+        m   = int(rem // SECONDS_PER_MINUTE); sc = rem - m * SECONDS_PER_MINUTE
+        if step_sec >= SECONDS_PER_YEAR: return f"An {yr+1}"
+        if step_sec >= SECONDS_PER_DAY:  return f"An {yr+1}\n{dm+1} {MONTH_NAMES[mi]}"
+        if step_sec >= 60:               return f"An {yr+1}\n{dm+1}{MONTH_NAMES[mi]} {h:02d}:{m:02d}"
+        return f"An {yr+1}\n{dm+1}{MONTH_NAMES[mi]} {h:02d}:{m:02d}:{int(sc):02d}"
+
+    # â”€â”€ Generic fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    if step_sec >= 1:    return f"{seconds:,.0f}s"
+    return f"{seconds:,.3f}s"
+
+
+# â”€â”€ Zoomable Timeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+

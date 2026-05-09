@@ -1,0 +1,461 @@
+﻿import tkinter as tk
+from typing import Optional
+import math
+
+from ..core.shared import (
+    PALETTE,
+    CosmicEvent,
+    CosmicPeriod,
+    SECONDS_PER_DAY,
+    SECONDS_PER_HOUR,
+    SECONDS_PER_MINUTE,
+    SECONDS_PER_YEAR,
+    format_axis_label,
+    pick_tick_step,
+)
+class ZoomableTimeline(tk.Canvas):
+    # 1e12 lets us drill down to ~30 microseconds on a 1-year target â€” far below
+    # second resolution, with float64 precision still safe.
+    MAX_ZOOM = 1e12
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, bg=PALETTE["panel"], highlightthickness=0, **kwargs)
+        self.events:  list[CosmicEvent]  = []
+        self.periods: list[CosmicPeriod] = []
+        self.target_seconds = SECONDS_PER_YEAR
+        self.realtime_ref_years: Optional[float] = None
+        self._view_start = 0.0
+        self._view_end   = 1.0
+        self._drag_x     = None
+        self._drag_vs    = None
+        self._tooltip_win = None
+
+        self.bind("<Configure>",       lambda _: self._redraw())
+        self.bind("<MouseWheel>",      self._on_wheel)
+        self.bind("<ButtonPress-1>",   self._on_drag_start)
+        self.bind("<B1-Motion>",       self._on_drag)
+        self.bind("<ButtonRelease-1>", lambda _: setattr(self, "_drag_x", None))
+        self.bind("<Motion>",          self._on_motion)
+        self.bind("<Leave>",           self._hide_tooltip)
+        self.bind("<Double-Button-1>", lambda _: self.reset_zoom())
+
+    def set_events(self, events):
+        self.events = events
+        self._redraw()
+
+    def set_periods(self, periods):
+        self.periods = periods
+        self._redraw()
+
+    def set_target(self, target_seconds, realtime_ref_years: Optional[float] = None):
+        self.target_seconds = target_seconds
+        self.realtime_ref_years = realtime_ref_years
+        self._redraw()
+
+    def reset_zoom(self):
+        self._view_start, self._view_end = 0.0, 1.0
+        self._redraw()
+
+    def focus_on_event(self, fraction: float):
+        """Pan / zoom so the event sits in the centre of the view."""
+        span = self._view_end - self._view_start
+        # Zoom in if currently fully zoomed-out (or close to it).
+        if span > 0.5:
+            span = 0.05
+        s = fraction - span / 2
+        e = s + span
+        if s < 0: s, e = 0.0, span
+        if e > 1: s, e = 1.0 - span, 1.0
+        self._view_start, self._view_end = s, e
+        self._redraw()
+
+    def focus_on_period(self, frac_start: float, frac_end: float):
+        """Set the view to encompass [frac_start, frac_end] with margin."""
+        inner  = max(1e-12, frac_end - frac_start)
+        margin = max(inner * 0.15, 1e-9)
+        s = max(0.0, frac_start - margin)
+        e = min(1.0, frac_end   + margin)
+        if e - s < 1e-12:
+            e = s + 1e-12
+        self._view_start, self._view_end = s, e
+        self._redraw()
+
+    def _frac_to_x(self, frac):
+        w = self.winfo_width()
+        return (frac - self._view_start) / (self._view_end - self._view_start) * w
+
+    def _x_to_frac(self, x):
+        w = self.winfo_width()
+        return self._view_start + x / w * (self._view_end - self._view_start)
+
+    def _clamp_view(self, s: float, e: float) -> tuple[float, float]:
+        # Allow up to a full span of overscroll past either edge so the user can
+        # drag the period boundary all the way to the centre of the canvas
+        # before zooming in.
+        span   = e - s
+        margin = span
+        if s < -margin: s, e = -margin, -margin + span
+        if e > 1 + margin: e, s = 1 + margin, 1 + margin - span
+        return s, e
+
+    def _on_wheel(self, event):
+        factor   = 0.75 if event.delta > 0 else 1.0 / 0.75
+        frac_at  = self._x_to_frac(event.x)
+        span     = self._view_end - self._view_start
+        # Allow zoom-out to cover up to 3Ã— the period so edges remain reachable.
+        new_span = max(1.0 / self.MAX_ZOOM, min(3.0, span * factor))
+        ratio    = (frac_at - self._view_start) / span
+        ns = frac_at - ratio * new_span
+        ne = ns + new_span
+        ns, ne = self._clamp_view(ns, ne)
+        self._view_start, self._view_end = ns, ne
+        self._redraw()
+
+    def _on_drag_start(self, event):
+        self._drag_x  = event.x
+        self._drag_vs = (self._view_start, self._view_end)
+
+    def _on_drag(self, event):
+        if self._drag_x is None: return
+        w    = self.winfo_width()
+        span = self._view_end - self._view_start
+        dx   = (event.x - self._drag_x) / w * span
+        s, e = self._drag_vs[0] - dx, self._drag_vs[1] - dx
+        s, e = self._clamp_view(s, e)
+        self._view_start, self._view_end = s, e
+        self._redraw()
+
+    def _on_motion(self, event):
+        # Event hits take priority (the marker is small and on top)
+        hit_ev = next((ev for ev in self.events
+                       if abs(self._frac_to_x(ev.fraction) - event.x) <= 7), None)
+        if hit_ev:
+            self._show_event_tooltip(event.x_root, event.y_root, hit_ev)
+            return
+        # Period hits use the cached rectangles from the last redraw
+        hit_p = self._find_period_at(event.x, event.y)
+        if hit_p:
+            self._show_period_tooltip(event.x_root, event.y_root, hit_p)
+            return
+        self._hide_tooltip()
+
+    def _find_period_at(self, x: float, y: float) -> Optional["CosmicPeriod"]:
+        for p, x0, y0, x1, y1 in getattr(self, "_period_hits", ()):
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return p
+        return None
+
+    def _build_tooltip(self, rx: int, ry: int, key) -> tk.Frame:
+        """Open a fresh tooltip window and return its inner frame for content."""
+        if self._tooltip_win and getattr(self._tooltip_win, "_key", None) is key:
+            return None  # already showing this exact item
+        self._hide_tooltip()
+        win = tk.Toplevel(self)
+        win._key = key
+        win.wm_overrideredirect(True)
+        win.wm_geometry(f"+{rx + 12}+{ry - 10}")
+        win.configure(bg=PALETTE["border"])
+        inner = tk.Frame(win, bg=PALETTE["panel2"], padx=10, pady=8)
+        inner.pack(padx=1, pady=1)
+        self._tooltip_win = win
+        return inner
+
+    def _show_event_tooltip(self, rx, ry, ev: CosmicEvent):
+        inner = self._build_tooltip(rx, ry, ev)
+        if inner is None: return
+        tk.Label(inner, text=ev.name, bg=PALETTE["panel2"],
+                 fg=ev.color, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(inner, text=f"Il y a {ev.years_ago:,.0f} ans",
+                 bg=PALETTE["panel2"], fg=PALETTE["muted"],
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        for line in ev.result_str.split("\n"):
+            tk.Label(inner, text=line, bg=PALETTE["panel2"],
+                     fg=PALETTE["text"], font=("Segoe UI", 9)).pack(anchor="w")
+        if ev.description:
+            tk.Frame(inner, bg=PALETTE["border"], height=1).pack(
+                fill="x", pady=(6, 4))
+            tk.Label(inner, text=ev.description, bg=PALETTE["panel2"],
+                     fg=PALETTE["text"], font=("Segoe UI", 9),
+                     wraplength=320, justify="left").pack(anchor="w")
+
+    def _show_period_tooltip(self, rx, ry, p: "CosmicPeriod"):
+        inner = self._build_tooltip(rx, ry, p)
+        if inner is None: return
+        tk.Label(inner, text=p.name, bg=PALETTE["panel2"],
+                 fg=p.color, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(inner,
+                 text=f"Il y a {p.years_ago_start:,.0f} â†’ {p.years_ago_end:,.0f} ans",
+                 bg=PALETTE["panel2"], fg=PALETTE["muted"],
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(inner, text=f"DurÃ©e affichÃ©e : {p.duration_str}",
+                 bg=PALETTE["panel2"], fg=PALETTE["text"],
+                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(2, 0))
+        # Dates on the target scale
+        if p.start_str:
+            tk.Label(inner,
+                     text="DÃ©but : " + p.start_str.split("\n")[0]
+                          + ("  Â·  " + p.start_str.split("\n")[1]
+                             if "\n" in p.start_str else ""),
+                     bg=PALETTE["panel2"], fg=PALETTE["text"],
+                     font=("Segoe UI", 9)).pack(anchor="w")
+        if p.end_str:
+            tk.Label(inner,
+                     text="Fin :    " + p.end_str.split("\n")[0]
+                          + ("  Â·  " + p.end_str.split("\n")[1]
+                             if "\n" in p.end_str else ""),
+                     bg=PALETTE["panel2"], fg=PALETTE["text"],
+                     font=("Segoe UI", 9)).pack(anchor="w")
+        if p.description:
+            tk.Frame(inner, bg=PALETTE["border"], height=1).pack(
+                fill="x", pady=(6, 4))
+            tk.Label(inner, text=p.description, bg=PALETTE["panel2"],
+                     fg=PALETTE["text"], font=("Segoe UI", 9),
+                     wraplength=320, justify="left").pack(anchor="w")
+
+    def _hide_tooltip(self, _=None):
+        if self._tooltip_win:
+            self._tooltip_win.destroy()
+            self._tooltip_win = None
+
+    def _redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 2 or h < 2: return
+
+        BAR_Y = h // 2 + 10
+        BAR_H = 8
+
+        self.create_rectangle(0, 0, w, h, fill=PALETTE["panel"], outline="")
+
+        # Shade the regions outside [0, 1] so overscrolled "void" is visually distinct.
+        x0 = self._frac_to_x(0.0)
+        x1 = self._frac_to_x(1.0)
+        if x0 > 0:
+            self.create_rectangle(0, 0, x0, h,
+                                   fill=PALETTE["bg"], outline="")
+        if x1 < w:
+            self.create_rectangle(x1, 0, w, h,
+                                   fill=PALETTE["bg"], outline="")
+
+        # Active bar only spans the period [0, 1].
+        bar_x0 = max(0, x0)
+        bar_x1 = min(w, x1)
+        if bar_x1 > bar_x0:
+            self.create_rectangle(bar_x0, BAR_Y - BAR_H // 2,
+                                   bar_x1, BAR_Y + BAR_H // 2,
+                                   fill=PALETTE["border"], outline="")
+
+        # Edge markers (start / end of period) when visible.
+        for frac, label, color in ((0.0, "DÃ©but", PALETTE["accent"]),
+                                    (1.0, "Aujourd'hui", PALETTE["accent2"])):
+            x = self._frac_to_x(frac)
+            if -2 <= x <= w + 2:
+                self.create_line(x, 0, x, h - 8,
+                                  fill=color, width=1, dash=(2, 3))
+                self.create_text(x + 3 if frac == 0 else x - 3, 4,
+                                  text=label, anchor="nw" if frac == 0 else "ne",
+                                  fill=color, font=("Segoe UI", 8, "bold"))
+
+        self._draw_axis(w, BAR_Y, BAR_H)
+        self._draw_events(w, h, BAR_Y, BAR_H)
+        self._draw_periods(w, h, BAR_Y, BAR_H)
+        self._draw_minimap(w, h)
+
+        zoom = 1.0 / (self._view_end - self._view_start)
+        self.create_text(w - 6, 4,
+                         text=f"Ã—{zoom:.1f}" if zoom >= 10 else f"Ã—{zoom:.2f}",
+                         anchor="ne", fill=PALETTE["muted"], font=("Segoe UI", 8))
+
+    def _draw_axis(self, w, bar_y, bar_h):
+        # Compute visible span in seconds and pick a "nice" tick step.
+        view_sec_start = self._view_start * self.target_seconds
+        view_sec_end   = self._view_end   * self.target_seconds
+        span_sec       = view_sec_end - view_sec_start
+        target_ticks   = max(4, min(10, w // 110))
+        step_sec       = pick_tick_step(span_sec, target_ticks)
+
+        # Align the first tick to a multiple of the step.
+        first_tick = math.floor(view_sec_start / step_sec) * step_sec
+        eps        = step_sec * 1e-6
+        t          = first_tick
+        safety     = 0
+        while t <= view_sec_end + eps and safety < 500:
+            safety += 1
+            # Only render ticks that fall within the actual period [0, target_seconds]
+            # â€” the overscroll zone past the period has no meaningful labels.
+            if (t >= view_sec_start - eps and
+                -eps <= t <= self.target_seconds + eps):
+                frac = t / self.target_seconds
+                x    = self._frac_to_x(frac)
+                self.create_line(x, bar_y + bar_h // 2,
+                                 x, bar_y + bar_h // 2 + 5,
+                                 fill=PALETTE["muted"], width=1)
+                label = format_axis_label(
+                    t, self.target_seconds, step_sec,
+                    realtime_ref_years=self.realtime_ref_years)
+                for j, line in enumerate(label.split("\n")):
+                    self.create_text(x, bar_y + bar_h // 2 + 7 + j * 10,
+                                     text=line, anchor="n",
+                                     fill=PALETTE["muted"], font=("Segoe UI", 7))
+            t += step_sec
+
+    def _draw_events(self, w, h, bar_y, bar_h):
+        if not self.events:
+            self.create_text(w//2, bar_y - 40,
+                             text="Aucun Ã©vÃ¨nement â€” ajoutez-en dans le panneau gauche",
+                             fill=PALETTE["muted"], font=("Segoe UI", 9, "italic"))
+            return
+
+        visible = [ev for ev in self.events
+                   if self._view_start - 0.001 <= ev.fraction <= self._view_end + 0.001]
+        if not visible:
+            self.create_text(w//2, bar_y - 40,
+                             text="Aucun Ã©vÃ¨nement visible â€” dÃ©zoomez ou faites glisser la vue",
+                             fill=PALETTE["muted"], font=("Segoe UI", 9, "italic"))
+            return
+
+        rows = self._assign_rows(visible, w)
+        ROW_H = 16
+
+        for ev in visible:
+            x   = self._frac_to_x(ev.fraction)
+            row = rows.get(id(ev), 0)
+            top = bar_y - bar_h//2 - (row + 1) * ROW_H - 4
+
+            # Dashed line
+            self.create_line(x, top + ROW_H - 2, x, bar_y - bar_h//2,
+                             fill=ev.color, width=1, dash=(3, 2))
+
+            # Diamond on bar
+            s = 5
+            self.create_polygon(x, bar_y - bar_h//2 - s,
+                                 x + s, bar_y,
+                                 x, bar_y + bar_h//2 + s,
+                                 x - s, bar_y,
+                                 fill=ev.color, outline="")
+
+            # Label pill
+            label = ev.name if len(ev.name) <= 22 else ev.name[:20] + "â€¦"
+            lw    = len(label) * 5 + 10
+            ly    = top + ROW_H - 4
+            self.create_rectangle(x - lw//2, ly - 12, x + lw//2, ly + 2,
+                                   fill=PALETTE["panel2"], outline=ev.color, width=1)
+            self.create_text(x, ly - 5, text=label, anchor="center",
+                             fill=ev.color, font=("Segoe UI", 7, "bold"))
+
+    def _assign_rows(self, events, w):
+        MIN_GAP = 84
+        rows: list[float] = []
+        result: dict[int, int] = {}
+        for ev in sorted(events, key=lambda e: e.fraction):
+            x      = self._frac_to_x(ev.fraction)
+            placed = False
+            for r, last_x in enumerate(rows):
+                if x - last_x >= MIN_GAP:
+                    result[id(ev)] = r
+                    rows[r] = x
+                    placed = True
+                    break
+            if not placed:
+                result[id(ev)] = len(rows)
+                rows.append(x)
+        return result
+
+    def _draw_periods(self, w, h, bar_y, bar_h):
+        self._period_hits = []  # cleared each redraw, used for hover detection
+        if not self.periods:
+            return
+
+        # Reserve area below the axis labels and above the minimap.
+        AREA_TOP = bar_y + bar_h // 2 + 44   # below axis ticks/labels
+        AREA_BOT = h - 14                    # above minimap
+        if AREA_BOT - AREA_TOP < 22:
+            return
+
+        # Filter & assign vertical rows to avoid overlap.
+        visible = [p for p in self.periods
+                   if not (p.fraction_end < self._view_start - 0.001
+                           or p.fraction_start > self._view_end + 0.001)]
+        if not visible:
+            return
+
+        rows: list[float] = []
+        assignment: dict[int, int] = {}
+        for p in sorted(visible, key=lambda x: x.fraction_start):
+            xs = self._frac_to_x(p.fraction_start)
+            xe = self._frac_to_x(p.fraction_end)
+            placed = False
+            for r, last_xe in enumerate(rows):
+                if xs - last_xe >= 4:
+                    assignment[id(p)] = r
+                    rows[r] = xe
+                    placed = True
+                    break
+            if not placed:
+                assignment[id(p)] = len(rows)
+                rows.append(xe)
+
+        n_rows = max(len(rows), 1)
+        row_h  = max(20, min(40, (AREA_BOT - AREA_TOP) // n_rows))
+
+        for p in visible:
+            xs = self._frac_to_x(p.fraction_start)
+            xe = self._frac_to_x(p.fraction_end)
+            x0 = max(-2, xs)
+            x1 = min(w + 2, xe)
+            row = assignment.get(id(p), 0)
+            y0  = AREA_TOP + row * row_h
+            y1  = y0 + row_h - 4
+
+            # Cache hit-test rectangle for tooltip on hover.
+            self._period_hits.append((p, x0, y0, x1, y1))
+
+            # Hatched fill block, solid colored border.
+            self.create_rectangle(x0, y0, x1, y1,
+                                   fill=p.color, outline=p.color, width=1,
+                                   stipple="gray25")
+            # End-cap markers: vertical bars at start & end (clipped to view).
+            if xs >= -2:
+                self.create_line(xs, y0, xs, y1, fill=p.color, width=2)
+            if xe <= w + 2:
+                self.create_line(xe, y0, xe, y1, fill=p.color, width=2)
+
+            block_w = x1 - x0
+            label   = f"{p.name}  Â·  {p.duration_str}"
+            if block_w >= 90:
+                self.create_text((x0 + x1) // 2, (y0 + y1) // 2,
+                                  text=label, fill=PALETTE["text"],
+                                  font=("Segoe UI", 8, "bold"))
+            elif block_w >= 36:
+                self.create_text((x0 + x1) // 2, (y0 + y1) // 2,
+                                  text=p.name[:14], fill=PALETTE["text"],
+                                  font=("Segoe UI", 7, "bold"))
+            # When block is too narrow to hold any label, draw it just to the right.
+            elif xe < w:
+                self.create_text(xe + 4, (y0 + y1) // 2,
+                                  text=label, anchor="w",
+                                  fill=p.color, font=("Segoe UI", 7))
+
+    def _draw_minimap(self, w, h):
+        mm_h = 4
+        mm_y = h - mm_h - 2
+        self.create_rectangle(0, mm_y, w, mm_y + mm_h,
+                               fill=PALETTE["border"], outline="")
+        self.create_rectangle(int(self._view_start * w), mm_y,
+                               int(self._view_end * w), mm_y + mm_h,
+                               fill=PALETTE["accent"], outline="")
+        for ev in self.events:
+            mx = int(ev.fraction * w)
+            self.create_rectangle(mx - 1, mm_y, mx + 1, mm_y + mm_h,
+                                   fill=ev.color, outline="")
+        # Periods on the minimap as thin colored lanes.
+        for p in self.periods:
+            mxs = int(p.fraction_start * w)
+            mxe = int(p.fraction_end   * w)
+            self.create_rectangle(mxs, mm_y - 2, mxe, mm_y - 1,
+                                   fill=p.color, outline="")
+
+
+# â”€â”€ Edit dialog â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+

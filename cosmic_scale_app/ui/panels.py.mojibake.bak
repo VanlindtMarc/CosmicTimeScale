@@ -1,0 +1,991 @@
+﻿import tkinter as tk
+from tkinter import ttk
+from typing import Optional
+
+from ..core.shared import (
+    PALETTE,
+    PRESET_EVENTS,
+    PRESET_PERIODS,
+    date_to_years_ago,
+    format_period_summary,
+    parse_years_ago,
+)
+def _pick_unit(years_ago: float) -> tuple[str, float]:
+    """Choose the most readable unit + multiplier for an amount in years."""
+    y = abs(years_ago)
+    if y >= 1e9: return "milliards (Ga)", 1e9
+    if y >= 1e6: return "millions (Ma)",  1e6
+    if y >= 1e3: return "milliers (ka)",  1e3
+    return "annÃ©es", 1.0
+
+
+_AGO_UNITS = ["annÃ©es", "milliers (ka)", "millions (Ma)", "milliards (Ga)"]
+
+
+def _ago_unit_mult(unit_str: str) -> float:
+    if "Ga" in unit_str or "milliard" in unit_str: return 1e9
+    if "Ma" in unit_str or "million"  in unit_str: return 1e6
+    if "ka" in unit_str or "millier"  in unit_str: return 1e3
+    return 1.0
+
+
+class EditDialog(tk.Toplevel):
+    """
+    Edit an event or a period. `kind` is "event" or "period".
+    `on_save(payload: dict)` is invoked with new values when the user clicks
+    Enregistrer. Payload keys depend on kind.
+    """
+
+    def __init__(self, parent, kind: str, item, on_save, tags=None):
+        super().__init__(parent)
+        self.kind    = kind
+        self.item    = item
+        self.on_save = on_save
+        self.tags    = list(tags or ["general"])
+
+        self.title("Modifier l'Ã©vÃ¨nement" if kind == "event"
+                    else "Modifier la pÃ©riode")
+        self.configure(bg=PALETTE["bg"])
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+
+        self._build()
+
+        # Center over parent
+        self.update_idletasks()
+        try:
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            w  = self.winfo_width()
+            h  = self.winfo_height()
+            self.geometry(f"+{px + (pw - w)//2}+{py + (ph - h)//2}")
+        except Exception:
+            pass
+
+        self.bind("<Escape>", lambda _: self.destroy())
+
+    def _build(self):
+        outer = ttk.Frame(self, style="Panel.TFrame")
+        outer.pack(fill="both", expand=True, padx=2, pady=2)
+
+        ttk.Label(outer,
+                  text=("Modifier l'Ã©vÃ¨nement" if self.kind == "event"
+                        else "Modifier la pÃ©riode"),
+                  style="Section.TLabel").grid(row=0, column=0, columnspan=2,
+                                                sticky="w", padx=12, pady=(12, 6))
+
+        # â”€â”€ Name â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        ttk.Label(outer, text="Nom :", style="Muted.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(12, 6), pady=4)
+        self._name_var = tk.StringVar(value=self.item.name)
+        ttk.Entry(outer, textvariable=self._name_var, width=44).grid(
+            row=1, column=1, sticky="ew", padx=(0, 12), pady=4)
+        ttk.Label(outer, text="Tags :", style="Muted.TLabel").grid(
+            row=2, column=0, sticky="w", padx=(12, 6), pady=4)
+        tag_wrap = ttk.Frame(outer, style="Panel.TFrame")
+        tag_wrap.grid(row=2, column=1, sticky="ew", padx=(0, 12), pady=4)
+        selected_tags = set(getattr(self.item, "tag_names", ["general"]))
+        self._tag_vars = {}
+        for idx, tag_name in enumerate(self.tags):
+            var = tk.BooleanVar(value=(tag_name in selected_tags))
+            self._tag_vars[tag_name] = var
+            tk.Checkbutton(
+                tag_wrap, text=tag_name, variable=var,
+                bg=PALETTE["panel"], fg=PALETTE["text"],
+                activebackground=PALETTE["panel"],
+                activeforeground=PALETTE["text"],
+                selectcolor=PALETTE["entry"], highlightthickness=0
+            ).grid(row=idx // 2, column=idx % 2, sticky="w", padx=(0, 10), pady=2)
+
+        # â”€â”€ Years-ago fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if self.kind == "event":
+            self._build_ago_row(outer, row=3, label="Il y a (annÃ©es) :",
+                                 var_attr="_years_var", combo_attr="_unit_combo",
+                                 value=self.item.years_ago)
+        else:
+            self._build_ago_row(outer, row=3, label="DÃ©but (le + ancien) :",
+                                 var_attr="_ys_var", combo_attr="_us_combo",
+                                 value=self.item.years_ago_start)
+            self._build_ago_row(outer, row=4, label="Fin (le + rÃ©cent) :",
+                                 var_attr="_ye_var", combo_attr="_ue_combo",
+                                 value=self.item.years_ago_end)
+
+        desc_row = 5 if self.kind == "period" else 4
+
+        # â”€â”€ Description â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        ttk.Label(outer, text="Description :", style="Muted.TLabel").grid(
+            row=desc_row, column=0, sticky="nw", padx=(12, 6), pady=(8, 4))
+        self._desc_text = tk.Text(outer, height=5, width=46,
+                                    bg=PALETTE["entry"], fg=PALETTE["text"],
+                                    insertbackground=PALETTE["text"],
+                                    relief="flat", bd=4,
+                                    font=("Segoe UI", 9), wrap="word",
+                                    highlightthickness=1,
+                                    highlightbackground=PALETTE["border"],
+                                    highlightcolor=PALETTE["accent"])
+        self._desc_text.grid(row=desc_row, column=1, sticky="ew",
+                              padx=(0, 12), pady=(8, 4))
+        if self.item.description:
+            self._desc_text.insert("1.0", self.item.description)
+
+        # â”€â”€ Buttons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        btns = ttk.Frame(outer, style="Panel.TFrame")
+        btns.grid(row=desc_row + 1, column=0, columnspan=2,
+                   sticky="e", padx=12, pady=12)
+        ttk.Button(btns, text="Annuler",
+                   style="Small.TButton",
+                   command=self.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btns, text="Enregistrer",
+                   style="Accent.TButton",
+                   command=self._on_save).pack(side="right")
+
+        # Error label
+        self._err_var = tk.StringVar()
+        ttk.Label(outer, textvariable=self._err_var,
+                  foreground=PALETTE["accent2"],
+                  background=PALETTE["panel"],
+                  font=("Segoe UI", 9), wraplength=420).grid(
+            row=desc_row + 2, column=0, columnspan=2,
+            sticky="w", padx=12, pady=(0, 8))
+
+    def _build_ago_row(self, parent, row: int, label: str,
+                        var_attr: str, combo_attr: str, value: float):
+        ttk.Label(parent, text=label, style="Muted.TLabel").grid(
+            row=row, column=0, sticky="w", padx=(12, 6), pady=4)
+
+        unit_str, mult = _pick_unit(value)
+        var = tk.StringVar(value=f"{value / mult:g}")
+        setattr(self, var_attr, var)
+
+        wrap = ttk.Frame(parent, style="Panel.TFrame")
+        wrap.grid(row=row, column=1, sticky="w", padx=(0, 12), pady=4)
+        ttk.Entry(wrap, textvariable=var, width=14,
+                   font=("Segoe UI", 10)).pack(side="left")
+        combo = ttk.Combobox(wrap, values=_AGO_UNITS,
+                              state="readonly", width=16)
+        combo.set(unit_str)
+        combo.pack(side="left", padx=(6, 0))
+        setattr(self, combo_attr, combo)
+
+    # â”€â”€ Save â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _parse_ago(self, var: tk.StringVar, combo: ttk.Combobox) -> Optional[float]:
+        try:
+            v = float(var.get().replace(",", ".").replace(" ", ""))
+        except ValueError:
+            return None
+        return v * _ago_unit_mult(combo.get())
+
+    def _on_save(self):
+        self._err_var.set("")
+        name = self._name_var.get().strip()
+        if not name:
+            self._err_var.set("Le nom ne peut pas Ãªtre vide.")
+            return
+        desc = self._desc_text.get("1.0", "end").strip()
+        selected_tags = [
+            tag_name for tag_name, var in self._tag_vars.items()
+            if var.get()
+        ]
+        if not selected_tags:
+            self._err_var.set("Selectionnez au moins un tag.")
+            return
+
+        if self.kind == "event":
+            ya = self._parse_ago(self._years_var, self._unit_combo)
+            if ya is None:
+                self._err_var.set("Valeur 'il y a' invalide.")
+                return
+            self.on_save(dict(
+                name=name, description=desc, years_ago=ya,
+                tag_names=selected_tags))
+        else:
+            ys = self._parse_ago(self._ys_var, self._us_combo)
+            ye = self._parse_ago(self._ye_var, self._ue_combo)
+            if ys is None or ye is None:
+                self._err_var.set("Valeurs dÃ©but/fin invalides.")
+                return
+            if ye > ys:
+                ys, ye = ye, ys
+            if abs(ys - ye) < 1e-9:
+                self._err_var.set("Le dÃ©but et la fin sont identiques.")
+                return
+            self.on_save(dict(
+                name=name, description=desc,
+                years_ago_start=ys, years_ago_end=ye,
+                tag_names=selected_tags))
+        self.destroy()
+
+
+# â”€â”€ Event Input Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class EventInputPanel(ttk.Frame):
+    def __init__(self, parent, on_add, on_add_period,
+                 tag_names_provider=None, **kwargs):
+        super().__init__(parent, style="Panel.TFrame", **kwargs)
+        self.on_add        = on_add
+        self.on_add_period = on_add_period
+        self.tag_names_provider = tag_names_provider or (lambda: ["general"])
+        self._color_idx = 0
+        self._tag_vars: dict[str, tk.BooleanVar] = {}
+        self.columnconfigure(0, weight=1)
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="Ajouter un Ã©vÃ¨nement",
+                  style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+
+        # â”€â”€ Notebook tabs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        nb = ttk.Notebook(self)
+        nb.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self._notebook = nb
+
+        tab_ago    = ttk.Frame(nb, style="Panel.TFrame")
+        tab_date   = ttk.Frame(nb, style="Panel.TFrame")
+        tab_preset = ttk.Frame(nb, style="Panel.TFrame")
+        tab_period = ttk.Frame(nb, style="Panel.TFrame")
+        nb.add(tab_ago,    text=" Il y aâ€¦ ")
+        nb.add(tab_date,   text=" Date / Heure ")
+        nb.add(tab_preset, text=" PrÃ©dÃ©finis ")
+        nb.add(tab_period, text=" PÃ©riode ")
+
+        self._build_ago_tab(tab_ago)
+        self._build_date_tab(tab_date)
+        self._build_preset_tab(tab_preset)
+        self._build_period_tab(tab_period)
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
+
+        # â”€â”€ Name + description â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        name_row = ttk.Frame(self, style="Panel.TFrame")
+        name_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 0))
+        name_row.columnconfigure(1, weight=1)
+        ttk.Label(name_row, text="Nom :", style="Muted.TLabel").grid(
+            row=0, column=0, padx=(2, 6), sticky="w")
+        self._name_var = tk.StringVar()
+        ttk.Entry(name_row, textvariable=self._name_var).grid(
+            row=0, column=1, sticky="ew")
+
+        ttk.Label(name_row, text="Description :",
+                  style="Muted.TLabel").grid(row=1, column=0,
+                                              padx=(2, 6), sticky="nw",
+                                              pady=(4, 0))
+        self._desc_text = tk.Text(name_row, height=3,
+                                    bg=PALETTE["entry"], fg=PALETTE["text"],
+                                    insertbackground=PALETTE["text"],
+                                    relief="flat", bd=4,
+                                    font=("Segoe UI", 9), wrap="word",
+                                    highlightthickness=1,
+                                    highlightbackground=PALETTE["border"],
+                                    highlightcolor=PALETTE["accent"])
+        self._desc_text.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+
+        self._tags_frame = ttk.Frame(self, style="Panel.TFrame")
+        self._tags_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(6, 0))
+        self._tags_frame.columnconfigure(0, weight=1)
+        ttk.Label(self._tags_frame, text="Tags :", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(2, 0), pady=(0, 4))
+        self._tags_checks = ttk.Frame(self._tags_frame, style="Panel.TFrame")
+        self._tags_checks.grid(row=1, column=0, sticky="ew")
+        self._tags_checks.columnconfigure(0, weight=1)
+        self._tags_checks.columnconfigure(1, weight=1)
+        self.refresh_tag_choices()
+
+        # â”€â”€ Add button (label updates with the active tab) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        self._add_btn_text = tk.StringVar(value="ï¼‹  Ajouter l'Ã©vÃ¨nement")
+        self._add_btn = ttk.Button(self, textvariable=self._add_btn_text,
+                                    style="Accent.TButton",
+                                    command=self._on_add_click)
+        self._add_btn.grid(row=4, column=0, sticky="ew", padx=8, pady=8)
+
+        self._err_var = tk.StringVar()
+        ttk.Label(self, textvariable=self._err_var,
+                  foreground=PALETTE["accent2"],
+                  background=PALETTE["panel"],
+                  font=("Segoe UI", 8), wraplength=260).grid(
+            row=5, column=0, sticky="w", padx=10, pady=(0, 8))
+
+    def _build_ago_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        f = ttk.Frame(parent, style="Panel.TFrame")
+        f.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        f.columnconfigure(0, weight=1)
+        self._ago_var = tk.StringVar(value="4.54 Ga")
+        entry = ttk.Entry(f, textvariable=self._ago_var,
+                          font=("Segoe UI", 11), width=18)
+        entry.grid(row=0, column=0, sticky="ew")
+        entry.bind("<Return>", lambda _: self._on_add_click())
+        unit_vals = ["annÃ©es", "milliers (ka)", "millions (Ma)", "milliards (Ga)"]
+        self._ago_unit = ttk.Combobox(f, values=unit_vals, state="readonly", width=16)
+        self._ago_unit.current(3)
+        self._ago_unit.grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(parent, text="Ex : 4.54  Â·  4 540 000 000  Â·  4,54Ga  Â·  4.54 billion",
+                  style="Muted.TLabel").grid(row=1, column=0, padx=8, pady=(0, 6), sticky="w")
+
+    def _build_date_tab(self, parent):
+        # Mirror the layout of the "Il y aâ€¦" tab: a sub-frame with ttk.Entry widgets.
+        parent.columnconfigure(0, weight=1)
+        wrap = ttk.Frame(parent, style="Panel.TFrame")
+        wrap.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        wrap.columnconfigure(1, weight=0)
+
+        rows = [
+            ("AnnÃ©e",   "_year_var",  12, "1969",  "nÃ©gatif = avant J.-C."),
+            ("Mois",    "_month_var",  6, "1",     "1 â€“ 12"),
+            ("Jour",    "_day_var",    6, "1",     "1 â€“ 31"),
+            ("Heure",   "_hour_var",   6, "0",     "0 â€“ 23"),
+            ("Minute",  "_min_var",    6, "0",     "0 â€“ 59"),
+            ("Seconde", "_sec_var",    6, "0",     "0 â€“ 59"),
+        ]
+        for i, (label, attr, w, default, hint) in enumerate(rows):
+            ttk.Label(wrap, text=label + " :", style="Muted.TLabel").grid(
+                row=i, column=0, sticky="w", padx=(0, 8), pady=3)
+            var = tk.StringVar(value=default)
+            setattr(self, attr, var)
+            entry = ttk.Entry(wrap, textvariable=var, width=w,
+                               font=("Segoe UI", 10))
+            entry.grid(row=i, column=1, sticky="w", pady=3)
+            if hint:
+                ttk.Label(wrap, text="  " + hint,
+                          style="Muted.TLabel").grid(
+                    row=i, column=2, sticky="w", padx=(8, 0))
+
+    def _build_preset_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        ttk.Label(parent, text="SÃ©lectionner :", style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=8, pady=(6, 2))
+        self._preset_combo = ttk.Combobox(
+            parent,
+            values=[f"{n}  ({y:,} ans)" for n, y, *_ in PRESET_EVENTS],
+            state="readonly", width=36)
+        self._preset_combo.current(2)
+        self._preset_combo.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self._preset_combo.bind("<<ComboboxSelected>>", self._on_preset_select)
+        ttk.Button(parent, text="Ajouter tous les prÃ©dÃ©finis",
+                   command=self._add_all_presets, style="Small.TButton").grid(
+            row=2, column=0, sticky="w", padx=8, pady=(0, 6))
+
+    def _on_preset_select(self, _=None):
+        idx = self._preset_combo.current()
+        if idx >= 0:
+            name, _years, *rest = PRESET_EVENTS[idx]
+            self._name_var.set(name)
+            self._set_description(rest[0] if rest else "")
+
+    # â”€â”€ Description helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    def _get_description(self) -> str:
+        return self._desc_text.get("1.0", "end").strip()
+
+    def _set_description(self, text: str):
+        self._desc_text.delete("1.0", "end")
+        if text:
+            self._desc_text.insert("1.0", text)
+
+    def refresh_tag_choices(self):
+        previous = {
+            name for name, var in self._tag_vars.items()
+            if var.get()
+        } or {"general"}
+        for child in self._tags_checks.winfo_children():
+            child.destroy()
+        self._tag_vars.clear()
+
+        for idx, tag_name in enumerate(self.tag_names_provider()):
+            var = tk.BooleanVar(value=(tag_name in previous))
+            self._tag_vars[tag_name] = var
+            tk.Checkbutton(
+                self._tags_checks, text=tag_name, variable=var,
+                bg=PALETTE["panel"], fg=PALETTE["text"],
+                activebackground=PALETTE["panel"],
+                activeforeground=PALETTE["text"],
+                selectcolor=PALETTE["entry"], highlightthickness=0
+            ).grid(row=idx // 2, column=idx % 2, sticky="w", padx=(0, 10), pady=2)
+
+    def _selected_tag_names(self) -> list[str]:
+        selected = [
+            name for name, var in self._tag_vars.items()
+            if var.get()
+        ]
+        return selected or ["general"]
+
+    def _reset_tag_selection(self):
+        for tag_name, var in self._tag_vars.items():
+            var.set(tag_name == "general")
+
+    def _reset_inputs(self):
+        self._name_var.set("")
+        self._set_description("")
+        self._reset_tag_selection()
+
+    def _build_period_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+
+        # â”€â”€ Preset row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        ttk.Label(parent, text="PrÃ©set rapide :",
+                  style="Muted.TLabel").grid(
+            row=0, column=0, sticky="w", padx=8, pady=(6, 2))
+        self._period_preset_combo = ttk.Combobox(
+            parent,
+            values=[f"{n}  Â·  {format_period_summary(s, e)}"
+                    for n, s, e, *_ in PRESET_PERIODS],
+            state="readonly", width=44)
+        self._period_preset_combo.current(13)   # Jurassique
+        self._period_preset_combo.grid(row=1, column=0, sticky="ew",
+                                        padx=8, pady=(0, 2))
+        self._period_preset_combo.bind("<<ComboboxSelected>>",
+                                        self._on_period_preset_select)
+        ttk.Button(parent, text="Ajouter ce prÃ©set", style="Small.TButton",
+                   command=self._add_preset_period_click).grid(
+            row=2, column=0, sticky="w", padx=8, pady=(0, 4))
+
+        ttk.Separator(parent, orient="horizontal").grid(
+            row=3, column=0, sticky="ew", padx=8, pady=4)
+
+        # â”€â”€ Mode toggle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        mode = ttk.Frame(parent, style="Panel.TFrame")
+        mode.grid(row=4, column=0, sticky="w", padx=8, pady=(2, 4))
+        ttk.Label(mode, text="Saisie manuelle :",
+                  style="Muted.TLabel").pack(side="left", padx=(0, 8))
+        self._period_mode_var = tk.StringVar(value="date")
+        ttk.Radiobutton(mode, text="Date / Heure",
+                         variable=self._period_mode_var, value="date",
+                         command=self._on_period_mode_change).pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(mode, text="Il y aâ€¦",
+                         variable=self._period_mode_var, value="ago",
+                         command=self._on_period_mode_change).pack(side="left")
+
+        # â”€â”€ Container that swaps date / ago panels â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        container = ttk.Frame(parent, style="Panel.TFrame")
+        container.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 4))
+        container.columnconfigure(0, weight=1)
+
+        self._period_date_panel = ttk.Frame(container, style="Panel.TFrame")
+        self._period_date_panel.grid(row=0, column=0, sticky="ew")
+        self._build_period_date_panel(self._period_date_panel)
+
+        self._period_ago_panel = ttk.Frame(container, style="Panel.TFrame")
+        self._period_ago_panel.grid(row=0, column=0, sticky="ew")
+        self._build_period_ago_panel(self._period_ago_panel)
+        self._period_ago_panel.grid_remove()
+
+    def _build_period_date_panel(self, parent):
+        for col, title in enumerate(("DÃ©but", "Fin")):
+            ttk.Label(parent, text=title, style="Section.TLabel").grid(
+                row=0, column=col * 2, columnspan=2, sticky="w",
+                padx=(0 if col == 0 else 14, 0), pady=(0, 4))
+        rows = [
+            ("AnnÃ©e",   "year",  "1939", "1945", 8),
+            ("Mois",    "month", "1",    "1",    4),
+            ("Jour",    "day",   "1",    "1",    4),
+            ("Heure",   "hour",  "0",    "0",    4),
+            ("Minute",  "min",   "0",    "0",    4),
+            ("Seconde", "sec",   "0",    "0",    4),
+        ]
+        for i, (label, prefix, ds, de, w) in enumerate(rows):
+            for col, default in enumerate((ds, de)):
+                px = (0 if col == 0 else 14, 0)
+                ttk.Label(parent, text=label + " :",
+                          style="Muted.TLabel").grid(
+                    row=1 + i, column=col * 2, sticky="w", padx=px, pady=2)
+                var = tk.StringVar(value=default)
+                setattr(self,
+                         f"_period_{'start' if col == 0 else 'end'}_{prefix}_var",
+                         var)
+                ttk.Entry(parent, textvariable=var, width=w,
+                           font=("Segoe UI", 10)).grid(
+                    row=1 + i, column=col * 2 + 1, sticky="w", pady=2)
+
+    def _build_period_ago_panel(self, parent):
+        units = ["annÃ©es", "milliers (ka)", "millions (Ma)", "milliards (Ga)"]
+        for col, title in enumerate(("DÃ©but (le + ancien)", "Fin (le + rÃ©cent)")):
+            ttk.Label(parent, text=title, style="Section.TLabel").grid(
+                row=0, column=col * 2, columnspan=2, sticky="w",
+                padx=(0 if col == 0 else 14, 0), pady=(0, 4))
+
+        for col, default_val in enumerate(("201.4", "145")):
+            px = (0 if col == 0 else 14, 0)
+            ttk.Label(parent, text="Valeur :",
+                      style="Muted.TLabel").grid(
+                row=1, column=col * 2, sticky="w", padx=px, pady=2)
+            var = tk.StringVar(value=default_val)
+            setattr(self,
+                     f"_period_{'start' if col == 0 else 'end'}_ago_var",
+                     var)
+            ttk.Entry(parent, textvariable=var, width=10,
+                       font=("Segoe UI", 10)).grid(
+                row=1, column=col * 2 + 1, sticky="w", pady=2)
+
+            ttk.Label(parent, text="UnitÃ© :",
+                      style="Muted.TLabel").grid(
+                row=2, column=col * 2, sticky="w", padx=px, pady=2)
+            unit_combo = ttk.Combobox(parent, values=units,
+                                        state="readonly", width=14)
+            unit_combo.current(2)   # Ma
+            setattr(self,
+                     f"_period_{'start' if col == 0 else 'end'}_ago_unit",
+                     unit_combo)
+            unit_combo.grid(row=2, column=col * 2 + 1, sticky="w", pady=2)
+
+    def _on_period_mode_change(self):
+        if self._period_mode_var.get() == "date":
+            self._period_ago_panel.grid_remove()
+            self._period_date_panel.grid()
+        else:
+            self._period_date_panel.grid_remove()
+            self._period_ago_panel.grid()
+
+    def _on_period_preset_select(self, _=None):
+        idx = self._period_preset_combo.current()
+        if idx >= 0:
+            full_name, _ys, _ye, *rest = PRESET_PERIODS[idx]
+            self._name_var.set(full_name.split(" [")[0])
+            self._set_description(rest[0] if rest else "")
+
+    def _add_preset_period_click(self):
+        self._err_var.set("")
+        idx = self._period_preset_combo.current()
+        if idx < 0: return
+        full_name, ys, ye, desc = PRESET_PERIODS[idx]
+        name = self._name_var.get().strip() or full_name.split(" [")[0]
+        # Use the description from the textbox if user typed one, else the preset's.
+        description = self._get_description() or desc
+        self.on_add_period(name, float(ys), float(ye),
+                            self._next_color(), description,
+                            self._selected_tag_names())
+        self._reset_inputs()
+
+    @staticmethod
+    def _ago_unit_multiplier(unit_str: str) -> float:
+        if "Ga" in unit_str or "milliard" in unit_str: return 1e9
+        if "Ma" in unit_str or "million"  in unit_str: return 1e6
+        if "ka" in unit_str or "millier"  in unit_str: return 1e3
+        return 1.0
+
+    def _on_tab_change(self, _=None):
+        is_period = (self._notebook.index("current") == 3)
+        self._add_btn_text.set("ï¼‹  Ajouter la pÃ©riode" if is_period
+                                else "ï¼‹  Ajouter l'Ã©vÃ¨nement")
+
+    def _next_color(self) -> str:
+        c = EVENT_COLORS[self._color_idx % len(EVENT_COLORS)]
+        self._color_idx += 1
+        return c
+
+    def get_years_ago(self) -> Optional[float]:
+        tab = self._notebook.index("current")
+        if tab == 0:
+            raw    = self._ago_var.get().strip()
+            parsed = parse_years_ago(raw)
+            if parsed is not None: return parsed
+            try:   num = float(raw.replace(",", ".").replace(" ", ""))
+            except ValueError: return None
+            unit = self._ago_unit.get()
+            if "Ga" in unit or "milliard" in unit: return num * 1e9
+            if "Ma" in unit or "million"  in unit: return num * 1e6
+            if "ka" in unit or "millier"  in unit: return num * 1e3
+            return num
+        elif tab == 1:
+            try:
+                return date_to_years_ago(
+                    int(self._year_var.get()),
+                    int(self._month_var.get()),
+                    int(self._day_var.get()),
+                    int(self._hour_var.get()),
+                    int(self._min_var.get()),
+                    int(self._sec_var.get()))
+            except (ValueError, AttributeError):
+                return None
+        else:
+            idx = self._preset_combo.current()
+            return float(PRESET_EVENTS[idx][1]) if idx >= 0 else None
+
+    def _on_add_click(self):
+        self._err_var.set("")
+        if self._notebook.index("current") == 3:
+            self._on_add_period_click()
+            return
+        ya = self.get_years_ago()
+        if ya is None:
+            self._err_var.set("Valeur non reconnue.")
+            return
+        name = self._name_var.get().strip() or f"Ã‰vÃ¨nement {self._color_idx + 1}"
+        self.on_add(name, ya, self._next_color(), self._get_description(),
+                    self._selected_tag_names())
+        self._reset_inputs()
+
+    def _on_add_period_click(self):
+        if self._period_mode_var.get() == "date":
+            try:
+                ys = date_to_years_ago(
+                    int(self._period_start_year_var.get()),
+                    int(self._period_start_month_var.get()),
+                    int(self._period_start_day_var.get()),
+                    int(self._period_start_hour_var.get()),
+                    int(self._period_start_min_var.get()),
+                    int(self._period_start_sec_var.get()))
+                ye = date_to_years_ago(
+                    int(self._period_end_year_var.get()),
+                    int(self._period_end_month_var.get()),
+                    int(self._period_end_day_var.get()),
+                    int(self._period_end_hour_var.get()),
+                    int(self._period_end_min_var.get()),
+                    int(self._period_end_sec_var.get()))
+            except (ValueError, AttributeError):
+                self._err_var.set("Date de dÃ©but ou de fin invalide.")
+                return
+        else:
+            try:
+                ys_raw = float(self._period_start_ago_var.get()
+                                .replace(",", ".").replace(" ", ""))
+                ye_raw = float(self._period_end_ago_var.get()
+                                .replace(",", ".").replace(" ", ""))
+            except (ValueError, AttributeError):
+                self._err_var.set("Valeur 'il y a' invalide.")
+                return
+            ys = ys_raw * self._ago_unit_multiplier(
+                self._period_start_ago_unit.get())
+            ye = ye_raw * self._ago_unit_multiplier(
+                self._period_end_ago_unit.get())
+        # Ensure ys (start) is older than ye (end). If not, swap.
+        if ye > ys:
+            ys, ye = ye, ys
+        if abs(ys - ye) < 1e-9:
+            self._err_var.set("Le dÃ©but et la fin sont identiques.")
+            return
+        name = self._name_var.get().strip() or f"PÃ©riode {self._color_idx + 1}"
+        self.on_add_period(name, ys, ye, self._next_color(),
+                            self._get_description(),
+                            self._selected_tag_names())
+        self._reset_inputs()
+
+    def _add_all_presets(self):
+        for entry in PRESET_EVENTS:
+            name, years, *rest = entry
+            description = rest[0] if rest else ""
+            self.on_add(name, float(years), self._next_color(), description,
+                        self._selected_tag_names())
+
+
+# â”€â”€ Event / Period List Panel â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+class TagPanel(ttk.Frame):
+    def __init__(self, parent, on_add_tag, on_toggle_tag, **kwargs):
+        super().__init__(parent, style="Panel.TFrame", **kwargs)
+        self.on_add_tag = on_add_tag
+        self.on_toggle_tag = on_toggle_tag
+        self._tag_rows: dict[str, tk.Frame] = {}
+        self._highlighted_tag: Optional[str] = None
+        self.columnconfigure(0, weight=1)
+        self._build()
+
+    def _build(self):
+        ttk.Label(self, text="Tags",
+                  style="Section.TLabel").grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+
+        add_row = ttk.Frame(self, style="Panel.TFrame")
+        add_row.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
+        add_row.columnconfigure(0, weight=1)
+        self._tag_name_var = tk.StringVar()
+        ttk.Entry(add_row, textvariable=self._tag_name_var).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(add_row, text="Ajouter", style="Small.TButton",
+                   command=self._on_add_tag_click).grid(row=0, column=1)
+
+        ttk.Label(self,
+                  text="Glissez un evenement ou une periode depuis la liste de droite pour lui ajouter un tag.",
+                  style="Muted.TLabel",
+                  font=("Segoe UI", 8, "italic"),
+                  wraplength=260).grid(
+            row=2, column=0, sticky="w", padx=10, pady=(0, 6))
+
+        self._tags_wrap = ttk.Frame(self, style="Panel.TFrame")
+        self._tags_wrap.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self._tags_wrap.columnconfigure(0, weight=1)
+
+    def _on_add_tag_click(self):
+        name = self._tag_name_var.get().strip()
+        if self.on_add_tag(name):
+            self._tag_name_var.set("")
+
+    def refresh_tags(self, tags: dict, events: list, periods: list):
+        for child in self._tags_wrap.winfo_children():
+            child.destroy()
+        self._tag_rows.clear()
+
+        counts: dict[str, int] = {}
+        for ev in events:
+            for tag_name in ev.tag_names:
+                counts[tag_name] = counts.get(tag_name, 0) + 1
+        for per in periods:
+            for tag_name in per.tag_names:
+                counts[tag_name] = counts.get(tag_name, 0) + 1
+
+        for row_idx, (tag_name, tag) in enumerate(tags.items()):
+            row = tk.Frame(self._tags_wrap, bg=PALETTE["panel2"],
+                           highlightthickness=1,
+                           highlightbackground=PALETTE["border"])
+            row.grid(row=row_idx, column=0, sticky="ew", pady=2)
+            row.grid_columnconfigure(0, weight=1)
+
+            title = tk.Label(row, text=tag_name, bg=PALETTE["panel2"],
+                             fg=PALETTE["text"], anchor="w",
+                             font=("Segoe UI", 9, "bold"))
+            title.grid(row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+
+            meta_parts = [f"{counts.get(tag_name, 0)} element(s)"]
+            if tag.locked_visible:
+                meta_parts.append("toujours visible")
+            meta = tk.Label(row, text="  Â·  ".join(meta_parts),
+                            bg=PALETTE["panel2"], fg=PALETTE["muted"],
+                            anchor="w", font=("Segoe UI", 8))
+            meta.grid(row=1, column=0, sticky="w", padx=8, pady=(0, 6))
+
+            visible_var = tk.BooleanVar(value=(True if tag.locked_visible
+                                               else tag.visible))
+            chk = tk.Checkbutton(
+                row, text="Visible", variable=visible_var,
+                command=lambda n=tag_name, v=visible_var: self.on_toggle_tag(n, v.get()),
+                bg=PALETTE["panel2"], fg=PALETTE["text"],
+                activebackground=PALETTE["panel2"],
+                activeforeground=PALETTE["text"],
+                selectcolor=PALETTE["entry"], highlightthickness=0,
+                disabledforeground=PALETTE["muted"])
+            if tag.locked_visible:
+                chk.configure(state="disabled")
+            chk.grid(row=0, column=1, rowspan=2, sticky="e", padx=8)
+
+            self._tag_rows[tag_name] = row
+
+        self.set_drop_target(self._highlighted_tag)
+
+    def tag_at_root(self, x_root: int, y_root: int) -> Optional[str]:
+        for tag_name, row in self._tag_rows.items():
+            x0 = row.winfo_rootx()
+            y0 = row.winfo_rooty()
+            x1 = x0 + row.winfo_width()
+            y1 = y0 + row.winfo_height()
+            if x0 <= x_root <= x1 and y0 <= y_root <= y1:
+                return tag_name
+        return None
+
+    def set_drop_target(self, tag_name: Optional[str]):
+        self._highlighted_tag = tag_name
+        for name, row in self._tag_rows.items():
+            bg = PALETTE["hover"] if name == tag_name else PALETTE["panel2"]
+            border = PALETTE["accent"] if name == tag_name else PALETTE["border"]
+            row.configure(bg=bg, highlightbackground=border)
+            for child in row.winfo_children():
+                if isinstance(child, tk.Checkbutton):
+                    child.configure(bg=bg, activebackground=bg)
+                elif isinstance(child, tk.Label):
+                    child.configure(bg=bg)
+
+
+class EventListPanel(ttk.Frame):
+    """
+    Right-side scrollable list of events and periods.
+    Right-click â†’ Modifier / Supprimer.  Double-click â†’ focus on the timeline.
+    """
+
+    def __init__(self, parent, on_remove, on_remove_period,
+                 on_edit_event, on_edit_period,
+                 on_focus_event, on_focus_period, on_clear,
+                 on_begin_drag, **kwargs):
+        super().__init__(parent, style="Panel.TFrame", **kwargs)
+        self.on_remove        = on_remove
+        self.on_remove_period = on_remove_period
+        self.on_edit_event    = on_edit_event
+        self.on_edit_period   = on_edit_period
+        self.on_focus_event   = on_focus_event
+        self.on_focus_period  = on_focus_period
+        self.on_clear         = on_clear
+        self.on_begin_drag    = on_begin_drag
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+        self._build()
+
+    def _build(self):
+        hdr = ttk.Frame(self, style="Panel.TFrame")
+        hdr.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 2))
+        hdr.columnconfigure(0, weight=1)
+        ttk.Label(hdr, text="Ã‰vÃ¨nements ajoutÃ©s",
+                  style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(hdr, text="Tout effacer", style="Small.TButton",
+                   command=self.on_clear).grid(row=0, column=1)
+
+        ttk.Label(self,
+                  text="Clic-droit : modifier / supprimer  Â·  "
+                       "Double-clic : centrer dans la timeline",
+                  style="Muted.TLabel",
+                  font=("Segoe UI", 8, "italic")).grid(
+            row=1, column=0, sticky="w", padx=10, pady=(0, 4))
+
+        container = ttk.Frame(self, style="Panel.TFrame")
+        container.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        self._list_canvas = tk.Canvas(container, bg=PALETTE["panel"],
+                                        highlightthickness=0)
+        sb = ttk.Scrollbar(container, orient="vertical",
+                            command=self._list_canvas.yview)
+        self._list_frame = ttk.Frame(self._list_canvas, style="Panel.TFrame")
+        self._list_frame.columnconfigure(0, weight=1)
+        self._list_window = self._list_canvas.create_window(
+            (0, 0), window=self._list_frame, anchor="nw")
+
+        self._list_canvas.configure(yscrollcommand=sb.set)
+        self._list_canvas.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+
+        self._list_frame.bind(
+            "<Configure>",
+            lambda _: self._list_canvas.configure(
+                scrollregion=self._list_canvas.bbox("all")))
+        self._list_canvas.bind(
+            "<Configure>",
+            lambda e: self._list_canvas.itemconfig(
+                self._list_window, width=e.width))
+        # Mousewheel scroll only while hovering over the list.
+        def _scroll(e):
+            self._list_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        self._list_canvas.bind("<Enter>",
+            lambda _: self._list_canvas.bind_all("<MouseWheel>", _scroll))
+        self._list_canvas.bind("<Leave>",
+            lambda _: self._list_canvas.unbind_all("<MouseWheel>"))
+
+    # â”€â”€ Row interactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _bind_row_actions(self, widget, kind: str, idx: int, label: str):
+        """Right-click = context menu, double-click = focus on timeline."""
+        def show(event):
+            menu = tk.Menu(self, tearoff=0,
+                            bg=PALETTE["panel2"], fg=PALETTE["text"],
+                            activebackground=PALETTE["accent"],
+                            activeforeground="#0d1117",
+                            bd=0, font=("Segoe UI", 9))
+            if kind == "event":
+                menu.add_command(label="Centrer dans la timeline",
+                                  command=lambda: self.on_focus_event(idx))
+                menu.add_command(label="Modifierâ€¦",
+                                  command=lambda: self.on_edit_event(idx))
+                menu.add_separator()
+                menu.add_command(label="Supprimer",
+                                  command=lambda: self.on_remove(idx))
+            else:
+                menu.add_command(label="Centrer dans la timeline",
+                                  command=lambda: self.on_focus_period(idx))
+                menu.add_command(label="Modifierâ€¦",
+                                  command=lambda: self.on_edit_period(idx))
+                menu.add_separator()
+                menu.add_command(label="Supprimer",
+                                  command=lambda: self.on_remove_period(idx))
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        def dbl_click(_):
+            if kind == "event": self.on_focus_event(idx)
+            else:               self.on_focus_period(idx)
+
+        def start_drag(event):
+            self.on_begin_drag(kind, idx, label, event)
+
+        def attach(w):
+            w.bind("<Button-3>", show)
+            w.bind("<Double-Button-1>", dbl_click)
+            if not isinstance(w, tk.Button):
+                w.bind("<ButtonPress-1>", start_drag)
+            for child in w.winfo_children():
+                attach(child)
+        attach(widget)
+
+    def refresh_list(self, events: list, periods: list):
+        for w in self._list_frame.winfo_children():
+            w.destroy()
+        if not events and not periods:
+            ttk.Label(self._list_frame, text="(aucun Ã©vÃ¨nement ni pÃ©riode)",
+                      style="Muted.TLabel").pack(padx=8, pady=6)
+            return
+
+        # â”€â”€ Events section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if events:
+            ttk.Label(self._list_frame, text="Ã‰vÃ¨nements",
+                      style="Muted.TLabel",
+                      foreground=PALETTE["accent"]).pack(
+                anchor="w", padx=6, pady=(2, 0))
+            sorted_events = sorted(enumerate(events), key=lambda p: p[1].fraction)
+            for (real_idx, ev) in sorted_events:
+                row = ttk.Frame(self._list_frame, style="Panel.TFrame")
+                row.pack(fill="x", padx=4, pady=1)
+                row.columnconfigure(1, weight=1)
+                dot = tk.Canvas(row, width=10, height=10, bg=PALETTE["panel"],
+                                 highlightthickness=0)
+                dot.create_oval(1, 1, 9, 9, fill=ev.color, outline="")
+                dot.grid(row=0, column=0, padx=(2, 4), pady=2)
+                tk.Label(row, text=ev.name, bg=PALETTE["panel"], fg=ev.color,
+                         font=("Segoe UI", 9, "bold"), anchor="w").grid(
+                    row=0, column=1, sticky="w")
+                parts = ev.result_str.split("\n") if ev.result_str else []
+                detail_lines = []
+                if parts:
+                    detail_lines.extend(parts[:2])
+                detail_lines.append(
+                    f"Tags : {', '.join(ev.tag_names)}")
+                ttk.Label(row, text="\n".join(detail_lines), style="Muted.TLabel",
+                          justify="left").grid(row=1, column=1, sticky="w")
+                tk.Button(row, text="âœ•", bg=PALETTE["panel"], fg=PALETTE["muted"],
+                          font=("Segoe UI", 8), bd=0, cursor="hand2",
+                          command=lambda idx=real_idx: self.on_remove(idx)).grid(
+                    row=0, column=2, rowspan=2, padx=(4, 2))
+                self._bind_row_actions(row, "event", real_idx, ev.name)
+
+        # â”€â”€ Periods section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if periods:
+            ttk.Label(self._list_frame, text="PÃ©riodes",
+                      style="Muted.TLabel",
+                      foreground=PALETTE["accent"]).pack(
+                anchor="w", padx=6, pady=(8, 0))
+            sorted_periods = sorted(enumerate(periods),
+                                     key=lambda p: p[1].fraction_start)
+            for (real_idx, p) in sorted_periods:
+                row = ttk.Frame(self._list_frame, style="Panel.TFrame")
+                row.pack(fill="x", padx=4, pady=1)
+                row.columnconfigure(1, weight=1)
+                bar = tk.Canvas(row, width=10, height=10, bg=PALETTE["panel"],
+                                 highlightthickness=0)
+                bar.create_rectangle(1, 4, 9, 6, fill=p.color, outline="")
+                bar.grid(row=0, column=0, padx=(2, 4), pady=2)
+                tk.Label(row, text=p.name, bg=PALETTE["panel"], fg=p.color,
+                         font=("Segoe UI", 9, "bold"), anchor="w").grid(
+                    row=0, column=1, sticky="w")
+                sp = p.start_str.split("\n") if p.start_str else []
+                ep = p.end_str.split("\n")   if p.end_str   else []
+                date_line = (f"{sp[0] if sp else ''}  â†’  {ep[0] if ep else ''}"
+                              if (sp or ep) else "")
+                time_line = ""
+                if len(sp) > 1 or len(ep) > 1:
+                    s_t = sp[1] if len(sp) > 1 else ""
+                    e_t = ep[1] if len(ep) > 1 else ""
+                    time_line = f"{s_t}  â†’  {e_t}"
+                detail_lines = [l for l in (date_line, time_line,
+                                              f"DurÃ©e : {p.duration_str}",
+                                              f"Tags : {', '.join(p.tag_names)}") if l]
+                ttk.Label(row, text="\n".join(detail_lines),
+                          style="Muted.TLabel",
+                          justify="left").grid(row=1, column=1, sticky="w")
+                tk.Button(row, text="âœ•", bg=PALETTE["panel"], fg=PALETTE["muted"],
+                          font=("Segoe UI", 8), bd=0, cursor="hand2",
+                          command=lambda idx=real_idx: self.on_remove_period(idx)).grid(
+                    row=0, column=2, rowspan=2, padx=(4, 2))
+                self._bind_row_actions(row, "period", real_idx, p.name)
+
+
+# â”€â”€ Main Application â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
