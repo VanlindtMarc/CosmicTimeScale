@@ -77,6 +77,16 @@ Un clic droit sur un événement ou une période vous permet de :
 
 ![Microsoft](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/MS1.png)
 
+## Musique
+
+### Musique classique 
+
+![Classique 1](E:\Logiciels\STARTUPSENDTOMANAGER\Cosmic Time Scale\Classique1.png)
+
+![Classique 2](E:\Logiciels\STARTUPSENDTOMANAGER\Cosmic Time Scale\Classique2.png)
+
+![Classique 3](E:\Logiciels\STARTUPSENDTOMANAGER\Cosmic Time Scale\Classique3.png)
+
 
 # À venir 
 
