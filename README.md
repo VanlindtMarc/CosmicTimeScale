@@ -49,7 +49,7 @@ Vous pouvez :
 - Définir la période à visualiser
 - Définir l'échelle à laquelle doit être réduite la période visualisée
 
-![Ligne du temps](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/anim1.gif)
+![Ligne du temps](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/anim2.gif)
 
 ## Colonne de droite : Liste des événements et périodes
 
