@@ -87,6 +87,14 @@ Un clic droit sur un événement ou une période vous permet de :
 
 ![Classique 3](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Classique3.png)
 
+## Genesis - King Crimson - Pink Floyd - Rush - Yes
+
+![Prog 1](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Prog1.png)
+
+![Prog 2](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Prog2.png)
+
+![Prog 3](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Prog3.png)
+
 
 # À venir 
 
