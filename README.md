@@ -95,6 +95,10 @@ Un clic droit sur un événement ou une période vous permet de :
 
 ![Prog 3](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Prog3.png)
 
+## Ma vie dure un millénaire
+
+
+
 
 # À venir 
 
@@ -112,6 +116,11 @@ Un clic droit sur un événement ou une période vous permet de :
 
 - Supprimer d'un coup tout ce qui est dans "Non-classés"
 
+- Zoom automatique sur les événements et périodes
+
+- Zoom auto avec début de période à cette date
+
+- Dans la description : indiquer à quel groupe cet événement ou période est rattaché
 
 
 
