@@ -69,7 +69,9 @@ Un clic droit sur un événement ou une période vous permet de :
 
 ![Calendrier Cosmique 2](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Calendrier%20Cosmique%202.png)
 
+## Conflit
 
+![Conflit](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Conflit.png)
 
 
 # À venir 
