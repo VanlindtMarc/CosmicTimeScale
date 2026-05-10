@@ -87,7 +87,11 @@ class EditDialog(tk.Toplevel):
         ttk.Label(outer, text="Groupe :", style="Muted.TLabel").grid(
             row=2, column=0, sticky="w", padx=(12, 6), pady=4)
         current_group = getattr(self.item, "group_name", "Non-classés")
-        self._group_var = tk.StringVar(value=current_group)
+        # Find the matching hierarchical label (« Parent ▸ Enfant ») in `self.tags`.
+        match = next((label for label in self.tags
+                      if label.rsplit(" ▸ ", 1)[-1].strip() == current_group),
+                     current_group)
+        self._group_var = tk.StringVar(value=match)
         ttk.Combobox(outer, textvariable=self._group_var,
                       values=self.tags, state="readonly", width=42).grid(
             row=2, column=1, sticky="w", padx=(0, 12), pady=4)
@@ -350,7 +354,9 @@ class EditDialog(tk.Toplevel):
             self._err_var.set("Le nom ne peut pas être vide.")
             return
         desc = self._desc_text.get("1.0", "end").strip()
-        group_name = self._group_var.get().strip() or "Non-classés"
+        # Strip a hierarchical prefix « Parent ▸ » to keep just the leaf name.
+        raw_group = self._group_var.get().strip() or "Non-classés"
+        group_name = raw_group.rsplit(" ▸ ", 1)[-1].strip() or "Non-classés"
 
         date_mode = (self._mode_var.get() == "date")
 
@@ -561,19 +567,23 @@ class EventInputPanel(ttk.Frame):
             self._desc_text.insert("1.0", text)
 
     def refresh_tag_choices(self):
-        # Single-group selection via a combobox.
+        # Single-group selection via a combobox; values may be hierarchical
+        # labels (« Parent ▸ Enfant »).
         if not hasattr(self, "_group_combo"):
             return
-        previous = self._group_var.get() or "Non-classés"
+        prev_leaf = (self._group_var.get() or "").rsplit(" ▸ ", 1)[-1].strip() \
+                    or "Non-classés"
         choices = list(self.tag_names_provider())
         self._group_combo.configure(values=choices)
-        if previous in choices:
-            self._group_var.set(previous)
-        else:
-            self._group_var.set("Non-classés")
+        # Re-select the same leaf, keeping the new hierarchical prefix.
+        match = next((c for c in choices
+                      if c.rsplit(" ▸ ", 1)[-1].strip() == prev_leaf), None)
+        self._group_var.set(match or "Non-classés")
 
     def _selected_group_name(self) -> str:
-        return self._group_var.get() or "Non-classés"
+        # Strip the « Parent ▸ » prefix added by hierarchical labels.
+        raw = self._group_var.get() or "Non-classés"
+        return raw.rsplit(" ▸ ", 1)[-1].strip() or "Non-classés"
 
     def _reset_tag_selection(self):
         self._group_var.set("Non-classés")
@@ -884,7 +894,7 @@ class EventInputPanel(ttk.Frame):
 class TagPanel(ttk.Frame):
     def __init__(self, parent, on_add_tag, on_toggle_tag,
                  on_bulk_visibility, on_delete_tag,
-                 on_set_color, on_export_group, **kwargs):
+                 on_set_color, on_export_group, on_edit_tag, **kwargs):
         super().__init__(parent, style="Panel.TFrame", **kwargs)
         self.on_add_tag = on_add_tag
         self.on_toggle_tag = on_toggle_tag
@@ -892,7 +902,12 @@ class TagPanel(ttk.Frame):
         self.on_delete_tag = on_delete_tag
         self.on_set_color = on_set_color
         self.on_export_group = on_export_group
+        self.on_edit_tag = on_edit_tag
         self._tag_rows: dict[str, tk.Frame] = {}
+        self._collapsed_tags: set[str] = set()
+        self._last_tags: dict = {}
+        self._last_tag_events: list = []
+        self._last_tag_periods: list = []
         self._highlighted_tag: Optional[str] = None
         self.columnconfigure(0, weight=1)
         self._build()
@@ -939,10 +954,14 @@ class TagPanel(ttk.Frame):
 
     def _on_add_tag_click(self):
         name = self._tag_name_var.get().strip()
-        if self.on_add_tag(name):
+        # Top-level group (parent_name = None).
+        if self.on_add_tag(name, None):
             self._tag_name_var.set("")
 
     def refresh_tags(self, tags: dict, events: list, periods: list):
+        self._last_tags = tags
+        self._last_tag_events = events
+        self._last_tag_periods = periods
         for child in self._tags_wrap.winfo_children():
             child.destroy()
         self._tag_rows.clear()
@@ -953,17 +972,46 @@ class TagPanel(ttk.Frame):
         for per in periods:
             counts[per.group_name] = counts.get(per.group_name, 0) + 1
 
-        # Sort: locked tags (Non-classés) first, then alphabetical (case-insensitive).
-        sorted_tags = sorted(tags.items(),
-                              key=lambda kv: (not kv[1].locked_visible,
-                                              kv[0].lower()))
+        children_by_parent: dict[str, list[str]] = {}
+        for name, tag in tags.items():
+            if tag.parent_name:
+                children_by_parent.setdefault(tag.parent_name, []).append(name)
+        for children in children_by_parent.values():
+            children.sort(key=str.lower)
+        self._collapsed_tags.intersection_update(
+            {name for name in tags if children_by_parent.get(name)})
+
+        # Build the hierarchy: roots (locked default first), each followed by
+        # its descendants in tree order. Sub-groups are indented per depth.
+        def depth_of(name: str) -> int:
+            d, cur, seen = 0, tags.get(name), set()
+            while cur and cur.parent_name and cur.parent_name not in seen:
+                seen.add(cur.parent_name)
+                cur = tags.get(cur.parent_name)
+                d += 1
+            return d
+
+        def walk(name: str):
+            yield name
+            if name in self._collapsed_tags:
+                return
+            for c in children_by_parent.get(name, []):
+                yield from walk(c)
+
+        roots = sorted(
+            (n for n, t in tags.items() if not t.parent_name),
+            key=lambda n: (not tags[n].locked_visible, n.lower()))
+        ordered_names = [n for r in roots for n in walk(r)]
+        sorted_tags = [(n, tags[n]) for n in ordered_names]
+
         for row_idx, (tag_name, tag) in enumerate(sorted_tags):
+            indent = depth_of(tag_name) * 14    # px per level
             row = tk.Frame(self._tags_wrap, bg=PALETTE["panel2"],
                            highlightthickness=1,
                            highlightbackground=PALETTE["border"])
             row.grid(row=row_idx, column=0, sticky="ew", pady=2)
             # Column layout: 0=swatch (fixed) · 1=title/meta (expands) ·
-            # 2=visible toggle · 3=delete.
+            # 2=visible toggle · 3+=actions.
             row.grid_columnconfigure(0, weight=0)
             row.grid_columnconfigure(1, weight=1)
 
@@ -976,15 +1024,29 @@ class TagPanel(ttk.Frame):
                               highlightthickness=0)
             swatch.grid_propagate(False)
             swatch.grid(row=0, column=0, rowspan=2, sticky="w",
-                         padx=(8, 6), pady=8)
+                         padx=(8 + indent, 6), pady=8)
             swatch.bind("<Button-1>",
                          lambda _e, n=tag_name, c=color_value:
                             self._pick_color(n, c))
 
-            title = tk.Label(row, text=tag_name, bg=PALETTE["panel2"],
+            title_line = tk.Frame(row, bg=PALETTE["panel2"])
+            title_line.grid(row=0, column=1, sticky="w",
+                            padx=(0, 8), pady=(6, 0))
+            if children_by_parent.get(tag_name):
+                collapsed = tag_name in self._collapsed_tags
+                tk.Button(title_line, text=("▸" if collapsed else "▾"),
+                          bg=PALETTE["panel2"], fg=PALETTE["muted"],
+                          activebackground=PALETTE["panel2"],
+                          activeforeground=PALETTE["accent"],
+                          font=("Segoe UI", 8, "bold"), bd=0,
+                          width=2, cursor="hand2",
+                          command=lambda n=tag_name:
+                              self._toggle_group_collapsed(n)).pack(
+                    side="left", padx=(0, 2))
+            title = tk.Label(title_line, text=tag_name, bg=PALETTE["panel2"],
                              fg=PALETTE["text"], anchor="w",
                              font=("Segoe UI", 9, "bold"))
-            title.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=(6, 0))
+            title.pack(side="left")
 
             meta_parts = [f"{counts.get(tag_name, 0)} element(s)"]
             if tag.locked_visible:
@@ -1008,6 +1070,15 @@ class TagPanel(ttk.Frame):
                 chk.configure(state="disabled")
             chk.grid(row=0, column=2, rowspan=2, sticky="e", padx=(8, 0))
 
+            # Add-subgroup button — creates a child group under this one.
+            tk.Button(row, text="＋", bg=PALETTE["panel2"],
+                      fg=PALETTE["muted"],
+                      activebackground=PALETTE["panel2"],
+                      activeforeground=PALETTE["accent"],
+                      font=("Segoe UI", 9, "bold"), bd=0, cursor="hand2",
+                      command=lambda n=tag_name: self._prompt_subgroup(n)).grid(
+                row=0, column=3, rowspan=2, sticky="e", padx=(4, 0))
+
             # Export button — saves only this group's items to a .events file.
             tk.Button(row, text="💾", bg=PALETTE["panel2"],
                       fg=PALETTE["muted"],
@@ -1015,7 +1086,20 @@ class TagPanel(ttk.Frame):
                       activeforeground=PALETTE["accent"],
                       font=("Segoe UI", 9), bd=0, cursor="hand2",
                       command=lambda n=tag_name: self.on_export_group(n)).grid(
-                row=0, column=3, rowspan=2, sticky="e", padx=(4, 0))
+                row=0, column=4, rowspan=2, sticky="e", padx=(4, 0))
+
+            # Edit button — rename the group or move it under another parent.
+            if not tag.locked_visible:
+                tk.Button(row, text="✎", bg=PALETTE["panel2"],
+                          fg=PALETTE["muted"],
+                          activebackground=PALETTE["panel2"],
+                          activeforeground=PALETTE["accent"],
+                          font=("Segoe UI", 9), bd=0, cursor="hand2",
+                          command=lambda n=tag_name, ts=tags:
+                              self._prompt_edit_group(
+                                  n, ts, self.winfo_pointerx(),
+                                  self.winfo_pointery())).grid(
+                    row=0, column=5, rowspan=2, sticky="e", padx=(4, 0))
 
             # Delete button — hidden on the locked default tag.
             if not tag.locked_visible:
@@ -1025,9 +1109,128 @@ class TagPanel(ttk.Frame):
                           activeforeground=PALETTE["accent2"],
                           font=("Segoe UI", 9), bd=0, cursor="hand2",
                           command=lambda n=tag_name: self.on_delete_tag(n)).grid(
-                    row=0, column=4, rowspan=2, sticky="e", padx=(4, 8))
+                    row=0, column=6, rowspan=2, sticky="e", padx=(4, 8))
 
             self._tag_rows[tag_name] = row
+
+    def _toggle_group_collapsed(self, tag_name: str):
+        if tag_name in self._collapsed_tags:
+            self._collapsed_tags.remove(tag_name)
+        else:
+            self._collapsed_tags.add(tag_name)
+        self.refresh_tags(
+            getattr(self, "_last_tags", {}),
+            getattr(self, "_last_tag_events", []),
+            getattr(self, "_last_tag_periods", []))
+
+    def _prompt_edit_group(self, tag_name: str, tags: dict,
+                           x_root: Optional[int] = None,
+                           y_root: Optional[int] = None):
+        """Edit a group's name and parent while preventing hierarchy cycles."""
+        tag = tags.get(tag_name)
+        if tag is None or tag.locked_visible:
+            return
+
+        def descendants_of(name: str) -> set[str]:
+            out = set()
+            for child_name, child in tags.items():
+                if child.parent_name == name:
+                    out.add(child_name)
+                    out.update(descendants_of(child_name))
+            return out
+
+        def ancestors_of(name: str) -> list[str]:
+            out, cur, seen = [], name, set()
+            while cur and cur in tags and cur not in seen:
+                seen.add(cur)
+                out.append(cur)
+                cur = tags[cur].parent_name
+            return out
+
+        def label_for(name: str) -> str:
+            ancestors = ancestors_of(name)[1:]
+            if ancestors:
+                return " ▸ ".join(reversed(ancestors)) + " ▸ " + name
+            return name
+
+        forbidden = {tag_name, *descendants_of(tag_name)}
+        parent_names = sorted(
+            (n for n in tags if n not in forbidden),
+            key=lambda n: label_for(n).lower())
+
+        none_label = "(aucun parent)"
+        label_to_parent = {none_label: None}
+        for name in parent_names:
+            label_to_parent[label_for(name)] = name
+
+        win = tk.Toplevel(self)
+        win.title("Modifier le groupe")
+        win.configure(bg=PALETTE["bg"])
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        outer = ttk.Frame(win, style="Panel.TFrame")
+        outer.pack(fill="both", expand=True, padx=2, pady=2)
+        ttk.Label(outer, text="Modifier le groupe",
+                  style="Section.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8))
+
+        ttk.Label(outer, text="Nom :", style="Muted.TLabel").grid(
+            row=1, column=0, sticky="w", padx=(12, 6), pady=4)
+        name_var = tk.StringVar(value=tag_name)
+        ttk.Entry(outer, textvariable=name_var, width=38).grid(
+            row=1, column=1, sticky="ew", padx=(0, 12), pady=4)
+
+        ttk.Label(outer, text="Parent :", style="Muted.TLabel").grid(
+            row=2, column=0, sticky="w", padx=(12, 6), pady=4)
+        current_parent_label = none_label
+        if tag.parent_name in tags:
+            current_parent_label = label_for(tag.parent_name)
+        parent_var = tk.StringVar(value=current_parent_label)
+        ttk.Combobox(outer, textvariable=parent_var,
+                     values=list(label_to_parent.keys()),
+                     state="readonly", width=36).grid(
+            row=2, column=1, sticky="ew", padx=(0, 12), pady=4)
+
+        btns = ttk.Frame(outer, style="Panel.TFrame")
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=12)
+        ttk.Button(btns, text="Annuler", style="Small.TButton",
+                   command=win.destroy).pack(side="right", padx=(6, 0))
+
+        def save():
+            parent_name = label_to_parent.get(parent_var.get())
+            if self.on_edit_tag(tag_name, name_var.get(), parent_name):
+                win.destroy()
+
+        ttk.Button(btns, text="Enregistrer", style="Accent.TButton",
+                   command=save).pack(side="right")
+
+        win.update_idletasks()
+        try:
+            w, h = win.winfo_width(), win.winfo_height()
+            screen_w = win.winfo_screenwidth()
+            screen_h = win.winfo_screenheight()
+            x = (x_root if x_root is not None else self.winfo_rootx()) + 12
+            y = (y_root if y_root is not None else self.winfo_rooty()) + 12
+            x = max(0, min(x, screen_w - w - 20))
+            y = max(0, min(y, screen_h - h - 60))
+            win.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+        win.lift()
+        win.focus_force()
+
+    def _prompt_subgroup(self, parent_name: str):
+        """Ask the user for a name and create a sub-group under `parent_name`."""
+        from tkinter import simpledialog
+        name = simpledialog.askstring(
+            "Nouveau sous-groupe",
+            f"Nom du sous-groupe sous « {parent_name} » :",
+            parent=self)
+        if name and name.strip():
+            self.on_add_tag(name.strip(), parent_name)
 
     def _pick_color(self, tag_name: str, current_color: str = "#58a6ff"):
         from tkinter import colorchooser
@@ -1050,15 +1253,20 @@ class TagPanel(ttk.Frame):
 
     def set_drop_target(self, tag_name: Optional[str]):
         self._highlighted_tag = tag_name
+        def set_bg(widget, bg):
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Checkbutton):
+                    child.configure(bg=bg, activebackground=bg)
+                elif isinstance(child, (tk.Label, tk.Frame)):
+                    child.configure(bg=bg)
+                    set_bg(child, bg)
+                elif isinstance(child, tk.Button):
+                    child.configure(bg=bg, activebackground=bg)
         for name, row in self._tag_rows.items():
             bg = PALETTE["hover"] if name == tag_name else PALETTE["panel2"]
             border = PALETTE["accent"] if name == tag_name else PALETTE["border"]
             row.configure(bg=bg, highlightbackground=border)
-            for child in row.winfo_children():
-                if isinstance(child, tk.Checkbutton):
-                    child.configure(bg=bg, activebackground=bg)
-                elif isinstance(child, tk.Label):
-                    child.configure(bg=bg)
+            set_bg(row, bg)
 
 
 class EventListPanel(ttk.Frame):
@@ -1221,8 +1429,15 @@ class EventListPanel(ttk.Frame):
     FILTER_ALL     = "Tout"
     FILTER_VISIBLE = "Groupes visibles"
 
-    def set_group_choices(self, group_names: list[str]):
-        """Update the filter combo with the live list of groups."""
+    def set_group_choices(self, group_names: list[str],
+                           descendants_map: Optional[dict] = None):
+        """Update the filter combo with the live list of groups.
+
+        `group_names` may contain hierarchical labels (« Parent ▸ Enfant »).
+        `descendants_map` maps each leaf group name to the set of itself
+        plus every descendant — used so that picking a parent in the filter
+        shows all items under it, including those of its children.
+        """
         previous = self._filter_var.get()
         choices = [self.FILTER_ALL, self.FILTER_VISIBLE, *group_names]
         self._filter_choice_combo.configure(values=choices)
@@ -1230,6 +1445,11 @@ class EventListPanel(ttk.Frame):
             self._filter_var.set(previous)
         else:
             self._filter_var.set(self.FILTER_ALL)
+        self._descendants_map = descendants_map or {}
+
+    @staticmethod
+    def _label_to_leaf(label: str) -> str:
+        return label.rsplit(" ▸ ", 1)[-1].strip()
 
     def _on_search_change(self):
         self.refresh_list(self._last_events, self._last_periods,
@@ -1260,22 +1480,27 @@ class EventListPanel(ttk.Frame):
 
         # First filter by the chosen group, keeping master-list indices intact.
         # Filter values: "Tout" (no filter), "Groupes visibles" (union of
-        # currently-visible groups from the left panel) or a specific group.
+        # currently-visible groups from the left panel), or a hierarchical
+        # group label.  Picking a parent shows it AND all its descendants.
         chosen = (self._filter_var.get()
                   if hasattr(self, "_filter_var") else self.FILTER_ALL)
         if chosen == self.FILTER_VISIBLE and visible_groups is not None:
-            evt_pairs = [(i, e) for i, e in enumerate(events)
-                          if e.group_name in visible_groups]
-            per_pairs = [(i, p) for i, p in enumerate(periods)
-                          if p.group_name in visible_groups]
+            allowed = visible_groups
         elif chosen and chosen not in (self.FILTER_ALL, self.FILTER_VISIBLE):
-            evt_pairs = [(i, e) for i, e in enumerate(events)
-                          if e.group_name == chosen]
-            per_pairs = [(i, p) for i, p in enumerate(periods)
-                          if p.group_name == chosen]
+            leaf = self._label_to_leaf(chosen)
+            dmap = getattr(self, "_descendants_map", None) or {}
+            allowed = dmap.get(leaf, {leaf})
         else:
+            allowed = None
+
+        if allowed is None:
             evt_pairs = list(enumerate(events))
             per_pairs = list(enumerate(periods))
+        else:
+            evt_pairs = [(i, e) for i, e in enumerate(events)
+                          if e.group_name in allowed]
+            per_pairs = [(i, p) for i, p in enumerate(periods)
+                          if p.group_name in allowed]
 
         # Then apply the live name filter on top.
         filtered_events  = [(i, e) for (i, e) in evt_pairs if matches(e.name)]
@@ -1370,5 +1595,3 @@ class EventListPanel(ttk.Frame):
 
 
 # ── Main Application ───────────────────────────────────────────────────────────
-
-

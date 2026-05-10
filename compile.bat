@@ -1,0 +1,1 @@
+pyinstaller --onefile --windowed --name "CosmicScale" --clean --noconfirm cosmic_scale.py

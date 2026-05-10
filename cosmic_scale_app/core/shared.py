@@ -10,8 +10,25 @@ from pathlib import Path
 from typing import Optional
 import datetime
 import math
+import sys
 
-AUTOSAVE_PATH = Path(__file__).resolve().parents[2] / "autosave.events"
+
+def _app_dir() -> Path:
+    """Folder where `autosave.events` and user `.events` files live.
+
+    - When running as a script  → the project root (parents[2] of this file).
+    - When packaged with PyInstaller (`--onefile` or `--onedir`) →
+      the directory that *contains the .exe* (NOT the temporary `_MEIPASS`
+      where bundled resources are extracted), so the autosave is read and
+      written next to the executable.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+APP_DIR       = _app_dir()
+AUTOSAVE_PATH = APP_DIR / "autosave.events"
 FILE_TYPES = [
     ("Fichier d'évènements", "*.events"),
     ("JSON",                 "*.json"),
@@ -98,6 +115,18 @@ def shade_color(hex_color: str, factor: float) -> str:
     return rgb_to_hex(r, g, b)
 
 
+def child_default_color(parent_hex: str, key: str) -> str:
+    """Default color for a sub-group: a deterministic shade variation of
+    its parent, keeping the hue but shifting lightness."""
+    if not parent_hex:
+        return "#58a6ff"
+    import hashlib
+    h = hashlib.md5(key.encode("utf-8")).digest()
+    bucket = h[0] / 255.0
+    factor = (bucket * 2.0 - 1.0) * 0.45     # noticeable but not extreme
+    return shade_color(parent_hex, factor)
+
+
 def color_variant_for(base_hex: str, key: str) -> str:
     """Deterministic shade variation for an item inside a group.
 
@@ -155,11 +184,18 @@ class CosmicEvent:
 
 @dataclass
 class CosmicTag:
-    """Group of related events / periods with a shared base color."""
+    """Group of related events / periods with a shared base color.
+
+    `parent_name` makes groups hierarchical: when set, the group is a
+    sub-group of the named parent. Items only ever reference a single
+    group (`group_name`) — the tree is purely organisational and dictates
+    cascading visibility / color defaults / filter expansion.
+    """
     name: str
     color: str = "#58a6ff"            # base color of the group
     visible: bool = True
     locked_visible: bool = False
+    parent_name: Optional[str] = None
 
 
 @dataclass
@@ -246,10 +282,22 @@ def parse_years_ago(text: str) -> Optional[float]:
 
 def years_ago_to_datetime(years_ago: float) -> Optional[datetime.datetime]:
     try:
-        return _SESSION_NOW - datetime.timedelta(
+        dt = _SESSION_NOW - datetime.timedelta(
             seconds=years_ago * ASTRO_YEAR_SECONDS)
+        return _snap_datetime_to_second(dt)
     except OverflowError:
         return None
+
+
+def _snap_datetime_to_second(dt: datetime.datetime,
+                             tolerance_us: int = 1000) -> datetime.datetime:
+    """Remove tiny float round-trip errors around exact second boundaries."""
+    if dt.microsecond <= tolerance_us:
+        return dt.replace(microsecond=0)
+    if 1_000_000 - dt.microsecond <= tolerance_us:
+        return (dt + datetime.timedelta(
+            microseconds=1_000_000 - dt.microsecond)).replace(microsecond=0)
+    return dt
 
 
 def years_ago_to_iso(years_ago: float) -> Optional[str]:
@@ -432,13 +480,41 @@ def _month_day_from_day_of_year(day_of_year: int) -> tuple[int, int]:
     return 11, MONTH_DAYS[11] - 1
 
 
+def _format_axis_overflow_label(offset_seconds: float, step_sec: float) -> str:
+    """Format ticks that sit outside the compressed reference period."""
+    sign = "-" if offset_seconds < 0 else "+"
+    s = abs(offset_seconds)
+    if step_sec >= SECONDS_PER_YEAR:
+        years = s / SECONDS_PER_YEAR
+        unit = "an" if years < 2 else "ans"
+        return f"{sign}{years:,.0f} {unit}"
+    if step_sec >= SECONDS_PER_DAY:
+        return f"{sign}{s / SECONDS_PER_DAY:,.0f} j"
+    if step_sec >= SECONDS_PER_HOUR:
+        return f"{sign}{s / SECONDS_PER_HOUR:,.0f} h"
+    if step_sec >= SECONDS_PER_MINUTE:
+        minutes = int(s // SECONDS_PER_MINUTE)
+        seconds = int(s - minutes * SECONDS_PER_MINUTE)
+        return f"{sign}{minutes}:{seconds:02d}"
+    if step_sec >= 1:
+        minutes = int(s // SECONDS_PER_MINUTE)
+        seconds = int(s - minutes * SECONDS_PER_MINUTE)
+        return f"{sign}{minutes}:{seconds:02d}"
+    return f"{sign}{s:.3f}s"
+
+
 def format_axis_label(seconds: float, target_seconds: float, step_sec: float,
                       realtime_ref_years: Optional[float] = None) -> str:
     """Format a position on the timeline axis. May return a multi-line string."""
     if realtime_ref_years is not None:
         frac = 0.0 if target_seconds <= 0 else seconds / target_seconds
-        years_ago = max(0.0, realtime_ref_years * (1.0 - frac))
+        years_ago = realtime_ref_years * (1.0 - frac)
         return format_real_date_label(years_ago, step_sec)
+    boundary_eps = max(1e-9, step_sec * 1e-9)
+    if seconds < -boundary_eps:
+        return _format_axis_overflow_label(seconds, step_sec)
+    if seconds > target_seconds + boundary_eps:
+        return _format_axis_overflow_label(seconds - target_seconds, step_sec)
     # ── 1-year scale ──────────────────────────────────────────────────────────
     if abs(target_seconds - SECONDS_PER_YEAR) < 0.5:
         d   = int(seconds // SECONDS_PER_DAY)
@@ -489,4 +565,3 @@ def format_axis_label(seconds: float, target_seconds: float, step_sec: float,
 
 
 # ── Zoomable Timeline ──────────────────────────────────────────────────────────
-

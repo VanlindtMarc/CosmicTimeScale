@@ -13,7 +13,9 @@ from ..core.shared import (
     SECONDS_PER_MINUTE,
     SECONDS_PER_YEAR,
     format_axis_label,
+    format_calendar_year,
     format_real_date_label,
+    now_year_decimal,
     pick_tick_step,
     session_now,
 )
@@ -32,13 +34,17 @@ class ZoomableTimeline(tk.Canvas):
         self._view_end   = 1.0
         self._drag_x     = None
         self._drag_vs    = None
+        self._period_scroll_y = 0.0
+        self._period_scroll_drag = None
+        self._bar_drag = None
+        self._bar_y_ratio = 0.52
         self._tooltip_win = None
 
         self.bind("<Configure>",       lambda _: self._redraw())
         self.bind("<MouseWheel>",      self._on_wheel)
         self.bind("<ButtonPress-1>",   self._on_drag_start)
         self.bind("<B1-Motion>",       self._on_drag)
-        self.bind("<ButtonRelease-1>", lambda _: setattr(self, "_drag_x", None))
+        self.bind("<ButtonRelease-1>", self._on_drag_release)
         self.bind("<Motion>",          self._on_motion)
         self.bind("<Leave>",           self._hide_tooltip)
         self.bind("<Double-Button-1>", lambda _: self.reset_zoom())
@@ -49,6 +55,7 @@ class ZoomableTimeline(tk.Canvas):
 
     def set_periods(self, periods):
         self.periods = periods
+        self._period_scroll_y = 0.0
         self._redraw()
 
     def set_target(self, target_seconds, realtime_ref_years: Optional[float] = None):
@@ -139,10 +146,20 @@ class ZoomableTimeline(tk.Canvas):
         self._redraw()
 
     def _on_drag_start(self, event):
+        if self._start_period_scroll_drag(event):
+            return
+        if self._start_bar_drag(event):
+            return
         self._drag_x  = event.x
         self._drag_vs = (self._view_start, self._view_end)
 
     def _on_drag(self, event):
+        if self._period_scroll_drag is not None:
+            self._drag_period_scroll(event)
+            return
+        if self._bar_drag is not None:
+            self._drag_timeline_bar(event)
+            return
         if self._drag_x is None: return
         w    = self.winfo_width()
         span = self._view_end - self._view_start
@@ -150,6 +167,112 @@ class ZoomableTimeline(tk.Canvas):
         s, e = self._drag_vs[0] - dx, self._drag_vs[1] - dx
         s, e = self._clamp_view(s, e)
         self._view_start, self._view_end = s, e
+        self._redraw()
+
+    def _on_drag_release(self, _):
+        self._drag_x = None
+        self._period_scroll_drag = None
+        self._bar_drag = None
+
+    def _period_scroll_metrics(self):
+        return getattr(self, "_period_scroll_metrics_cache", None)
+
+    def _clamp_period_scroll(self):
+        metrics = self._period_scroll_metrics()
+        max_scroll = metrics["max_scroll"] if metrics else 0.0
+        self._period_scroll_y = max(0.0, min(max_scroll, self._period_scroll_y))
+
+    def _point_in_rect(self, x, y, rect):
+        if rect is None:
+            return False
+        x0, y0, x1, y1 = rect
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+    def _bar_y_bounds(self, h: Optional[int] = None) -> tuple[int, int]:
+        h = h if h is not None else self.winfo_height()
+        return (max(70, h // 5), max(90, h - 110))
+
+    def _current_bar_y(self, h: Optional[int] = None) -> int:
+        h = h if h is not None else self.winfo_height()
+        y_min, y_max = self._bar_y_bounds(h)
+        if y_max <= y_min:
+            return h // 2
+        self._bar_y_ratio = max(0.0, min(1.0, self._bar_y_ratio))
+        return round(y_min + self._bar_y_ratio * (y_max - y_min))
+
+    def _timeline_bar_hit_rect(self):
+        return getattr(self, "_timeline_bar_hit_rect_cache", None)
+
+    def _start_bar_drag(self, event) -> bool:
+        hit_rect = self._timeline_bar_hit_rect()
+        if not self._point_in_rect(event.x, event.y, hit_rect):
+            return False
+        self._bar_drag = {
+            "start_y": event.y,
+            "start_ratio": self._bar_y_ratio,
+        }
+        self._drag_x = None
+        return True
+
+    def _drag_timeline_bar(self, event):
+        h = self.winfo_height()
+        y_min, y_max = self._bar_y_bounds(h)
+        span = max(1, y_max - y_min)
+        dy = event.y - self._bar_drag["start_y"]
+        self._bar_y_ratio = self._bar_drag["start_ratio"] + dy / span
+        self._bar_y_ratio = max(0.0, min(1.0, self._bar_y_ratio))
+        self._clamp_period_scroll()
+        self._redraw()
+
+    def _scroll_periods_by(self, delta_y: float):
+        self._period_scroll_y += delta_y
+        self._clamp_period_scroll()
+        self._redraw()
+
+    def _scroll_periods_with_wheel(self, event) -> bool:
+        metrics = self._period_scroll_metrics()
+        if not metrics or metrics["max_scroll"] <= 0:
+            return False
+        if not self._point_in_rect(event.x, event.y, metrics["area_rect"]):
+            return False
+        direction = -1 if event.delta > 0 else 1
+        self._scroll_periods_by(direction * metrics["row_h"] * 2)
+        return True
+
+    def _start_period_scroll_drag(self, event) -> bool:
+        metrics = self._period_scroll_metrics()
+        if not metrics or metrics["max_scroll"] <= 0:
+            return False
+        if self._point_in_rect(event.x, event.y, metrics["thumb_rect"]):
+            self._period_scroll_drag = {
+                "start_y": event.y,
+                "start_scroll": self._period_scroll_y,
+            }
+            self._drag_x = None
+            return True
+        if self._point_in_rect(event.x, event.y, metrics["track_rect"]):
+            _, thumb_y0, _, thumb_y1 = metrics["thumb_rect"]
+            page = metrics["viewport_h"] * (1 if event.y > thumb_y1 else -1)
+            self._scroll_periods_by(page)
+            self._period_scroll_drag = {
+                "start_y": event.y,
+                "start_scroll": self._period_scroll_y,
+            }
+            self._drag_x = None
+            return True
+        return False
+
+    def _drag_period_scroll(self, event):
+        metrics = self._period_scroll_metrics()
+        if not metrics or metrics["max_scroll"] <= 0:
+            return
+        track_h = metrics["track_h"]
+        thumb_h = metrics["thumb_h"]
+        travel = max(1.0, track_h - thumb_h)
+        dy = event.y - self._period_scroll_drag["start_y"]
+        ratio = metrics["max_scroll"] / travel
+        self._period_scroll_y = self._period_scroll_drag["start_scroll"] + dy * ratio
+        self._clamp_period_scroll()
         self._redraw()
 
     def _on_motion(self, event):
@@ -284,7 +407,8 @@ class ZoomableTimeline(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 2 or h < 2: return
 
-        BAR_Y = h // 2 + 10
+        self._timeline_bar_hit_rect_cache = None
+        BAR_Y = self._current_bar_y(h)
         BAR_H = 8
 
         self.create_rectangle(0, 0, w, h, fill=PALETTE["panel"], outline="")
@@ -306,6 +430,10 @@ class ZoomableTimeline(tk.Canvas):
             self.create_rectangle(bar_x0, BAR_Y - BAR_H // 2,
                                    bar_x1, BAR_Y + BAR_H // 2,
                                    fill=PALETTE["border"], outline="")
+            self._timeline_bar_hit_rect_cache = (
+                bar_x0, BAR_Y - BAR_H - 4,
+                bar_x1, BAR_Y + BAR_H + 4,
+            )
 
         # Edge markers (start / end of period) when visible.
         for frac, label, color in ((0.0, "Début", PALETTE["accent"]),
@@ -351,8 +479,7 @@ class ZoomableTimeline(tk.Canvas):
         safety     = 0
         while t <= view_sec_end + eps and safety < 500:
             safety += 1
-            if (t >= view_sec_start - eps and
-                -eps <= t <= self.target_seconds + eps):
+            if t >= view_sec_start - eps:
                 frac = t / self.target_seconds
                 x    = self._frac_to_x(frac)
                 self.create_line(x, bar_y + bar_h // 2,
@@ -388,23 +515,38 @@ class ZoomableTimeline(tk.Canvas):
             return
 
     def _draw_axis_realtime_inner(self, w, bar_y, bar_h, ref):
-        ya_start = max(0.0, ref * (1.0 - self._view_start))   # older bound
-        ya_end   = max(0.0, ref * (1.0 - self._view_end))     # more recent
+        ya_start = ref * (1.0 - self._view_start)   # older bound
+        ya_end   = ref * (1.0 - self._view_end)     # more recent
         if ya_start < ya_end:
             ya_start, ya_end = ya_end, ya_start
 
         # Cap the date range to what `datetime` can represent (years 1..9999).
         # Without this the timedelta arithmetic raises and the whole redraw
-        # collapses, leaving the canvas visually empty.
+        # collapses, leaving the canvas visually empty. Negative years_ago
+        # are future dates, so clamp them against MAX_DT instead of snapping
+        # them back to "now".
         now_dt   = session_now()
         MIN_DT   = datetime.datetime(1, 1, 2)
         MAX_DT   = datetime.datetime(9999, 12, 30)
         max_back = max(0.0, (now_dt - MIN_DT).total_seconds())
         max_fwd  = max(0.0, (MAX_DT - now_dt).total_seconds())
-        ya_start_sec = min(ya_start * ASTRO_YEAR_SECONDS, max_back)
-        ya_end_sec   = min(ya_end   * ASTRO_YEAR_SECONDS, max_back)
+        raw_start_sec = ya_start * ASTRO_YEAR_SECONDS
+        raw_end_sec   = ya_end   * ASTRO_YEAR_SECONDS
+        if raw_start_sec > max_back or raw_end_sec > max_back:
+            self._draw_axis_realtime_approx(w, bar_y, bar_h,
+                                            ya_start, ya_end, ref)
+            return
+
+        def clamp_years_ago_seconds(years_ago: float) -> float:
+            seconds = years_ago * ASTRO_YEAR_SECONDS
+            return max(-max_fwd, min(max_back, seconds))
+
+        ya_start_sec = clamp_years_ago_seconds(ya_start)
+        ya_end_sec   = clamp_years_ago_seconds(ya_end)
         start_dt = now_dt - datetime.timedelta(seconds=ya_start_sec)
         end_dt   = now_dt - datetime.timedelta(seconds=ya_end_sec)
+        if end_dt < start_dt:
+            start_dt, end_dt = end_dt, start_dt
 
         span_seconds = max(1e-6, (end_dt - start_dt).total_seconds())
         target_ticks = max(4, min(10, w // 110))
@@ -444,6 +586,55 @@ class ZoomableTimeline(tk.Canvas):
                 cur_dt += full_step
             except OverflowError:
                 break
+
+    def _draw_axis_realtime_approx(self, w, bar_y, bar_h,
+                                   ya_start: float, ya_end: float, ref: float):
+        """Draw an approximate axis for calendar years outside datetime range."""
+        span_seconds = max(1e-6, (ya_start - ya_end) * ASTRO_YEAR_SECONDS)
+        target_ticks = max(4, min(10, w // 110))
+        step_sec     = pick_tick_step(span_seconds, target_ticks)
+
+        if step_sec >= ASTRO_YEAR_SECONDS:
+            now_year = now_year_decimal()
+            step_years = max(1.0, step_sec / ASTRO_YEAR_SECONDS)
+            year_start = now_year - ya_start
+            year_end   = now_year - ya_end
+            first_year = math.floor(year_start / step_years) * step_years
+            year = first_year
+            eps = step_years * 1e-6
+            safety = 0
+            while year <= year_end + eps and safety < 500:
+                safety += 1
+                if year >= year_start - eps:
+                    ya = now_year - year
+                    label = format_calendar_year(math.floor(year))
+                    self._draw_realtime_tick(w, bar_y, bar_h, ref, ya, label)
+                year += step_years
+            return
+
+        first_tick = math.floor((ya_end * ASTRO_YEAR_SECONDS) / step_sec) * step_sec
+        end_tick = ya_start * ASTRO_YEAR_SECONDS
+        t = first_tick
+        eps = step_sec * 1e-6
+        safety = 0
+        while t <= end_tick + eps and safety < 500:
+            safety += 1
+            ya = t / ASTRO_YEAR_SECONDS
+            if ya >= ya_end - eps / ASTRO_YEAR_SECONDS:
+                label = format_real_date_label(ya, step_sec)
+                self._draw_realtime_tick(w, bar_y, bar_h, ref, ya, label)
+            t += step_sec
+
+    def _draw_realtime_tick(self, w, bar_y, bar_h, ref, years_ago, label):
+        frac = (ref - years_ago) / ref
+        x    = self._frac_to_x(frac)
+        self.create_line(x, bar_y + bar_h // 2,
+                         x, bar_y + bar_h // 2 + 5,
+                         fill=PALETTE["muted"], width=1)
+        for j, line in enumerate(label.split("\n")):
+            self.create_text(x, bar_y + bar_h // 2 + 7 + j * 10,
+                             text=line, anchor="n",
+                             fill=PALETTE["muted"], font=("Segoe UI", 7))
 
     def _draw_events(self, w, h, bar_y, bar_h):
         # Cleared each redraw — hover hit-test uses these rectangles.
@@ -524,6 +715,7 @@ class ZoomableTimeline(tk.Canvas):
 
     def _draw_periods(self, w, h, bar_y, bar_h):
         self._period_hits = []  # cleared each redraw, used for hover detection
+        self._period_scroll_metrics_cache = None
         if not self.periods:
             return
 
@@ -557,47 +749,89 @@ class ZoomableTimeline(tk.Canvas):
                 rows.append(xe)
 
         n_rows = max(len(rows), 1)
-        row_h  = max(20, min(40, (AREA_BOT - AREA_TOP) // n_rows))
+        viewport_h = AREA_BOT - AREA_TOP
+        row_h  = max(20, min(40, viewport_h // n_rows))
+        content_h = n_rows * row_h
+        max_scroll = max(0.0, content_h - viewport_h)
+        self._period_scroll_y = max(0.0, min(max_scroll, self._period_scroll_y))
+
+        scrollbar_w = 8
+        gutter = 14 if max_scroll > 0 else 0
+        period_right = w - gutter
+        track_rect = (w - scrollbar_w - 3, AREA_TOP, w - 3, AREA_BOT)
+        thumb_rect = None
+        if max_scroll > 0:
+            track_h = viewport_h
+            thumb_h = max(24, track_h * viewport_h / max(content_h, 1))
+            travel = max(1.0, track_h - thumb_h)
+            thumb_y = AREA_TOP + (self._period_scroll_y / max_scroll) * travel
+            thumb_rect = (track_rect[0], thumb_y, track_rect[2], thumb_y + thumb_h)
+            self._period_scroll_metrics_cache = {
+                "area_rect": (0, AREA_TOP, w, AREA_BOT),
+                "track_rect": track_rect,
+                "thumb_rect": thumb_rect,
+                "track_h": track_h,
+                "thumb_h": thumb_h,
+                "viewport_h": viewport_h,
+                "content_h": content_h,
+                "max_scroll": max_scroll,
+                "row_h": row_h,
+            }
 
         for p in visible:
             xs = self._frac_to_x(p.fraction_start)
             xe = self._frac_to_x(p.fraction_end)
             x0 = max(-2, xs)
-            x1 = min(w + 2, xe)
+            x1 = min(period_right + 2, xe)
             row = assignment.get(id(p), 0)
-            y0  = AREA_TOP + row * row_h
+            y0  = AREA_TOP + row * row_h - self._period_scroll_y
             y1  = y0 + row_h - 4
+            if y1 < AREA_TOP or y0 > AREA_BOT:
+                continue
+            cy0 = max(AREA_TOP, y0)
+            cy1 = min(AREA_BOT, y1)
+            if cy1 - cy0 < 3:
+                continue
 
             # Cache hit-test rectangle for tooltip on hover.
-            self._period_hits.append((p, x0, y0, x1, y1))
+            self._period_hits.append((p, x0, cy0, x1, cy1))
 
             # Hatched fill block, solid colored border.
-            self.create_rectangle(x0, y0, x1, y1,
+            self.create_rectangle(x0, cy0, x1, cy1,
                                    fill=p.color, outline=p.color, width=1,
                                    stipple="gray25")
             # End-cap markers: vertical bars at start & end (clipped to view).
             if xs >= -2:
-                self.create_line(xs, y0, xs, y1, fill=p.color, width=2)
-            if xe <= w + 2:
-                self.create_line(xe, y0, xe, y1, fill=p.color, width=2)
+                self.create_line(xs, cy0, xs, cy1, fill=p.color, width=2)
+            if xe <= period_right + 2:
+                self.create_line(xe, cy0, xe, cy1, fill=p.color, width=2)
 
             block_w = x1 - x0
             suffix  = "  ·  en cours" if getattr(p, "is_ongoing", False) \
                       else f"  ·  {p.duration_str}"
             label   = f"{p.name}{suffix}"
-            if block_w >= 90:
-                self.create_text((x0 + x1) // 2, (y0 + y1) // 2,
+            label_y = (cy0 + cy1) // 2
+            if cy1 - cy0 >= 12 and block_w >= 90:
+                self.create_text((x0 + x1) // 2, label_y,
                                   text=label, fill=PALETTE["text"],
                                   font=("Segoe UI", 8, "bold"))
-            elif block_w >= 36:
-                self.create_text((x0 + x1) // 2, (y0 + y1) // 2,
+            elif cy1 - cy0 >= 12 and block_w >= 36:
+                self.create_text((x0 + x1) // 2, label_y,
                                   text=p.name[:14], fill=PALETTE["text"],
                                   font=("Segoe UI", 7, "bold"))
             # When block is too narrow to hold any label, draw it just to the right.
-            elif xe < w:
-                self.create_text(xe + 4, (y0 + y1) // 2,
+            elif cy1 - cy0 >= 12 and xe < period_right:
+                self.create_text(xe + 4, label_y,
                                   text=label, anchor="w",
                                   fill=p.color, font=("Segoe UI", 7))
+
+        if max_scroll > 0 and thumb_rect is not None:
+            self.create_rectangle(track_rect[0], track_rect[1],
+                                  track_rect[2], track_rect[3],
+                                  fill=PALETTE["bg"], outline=PALETTE["border"])
+            self.create_rectangle(thumb_rect[0], thumb_rect[1],
+                                  thumb_rect[2], thumb_rect[3],
+                                  fill=PALETTE["muted"], outline="")
 
     def _draw_minimap(self, w, h):
         mm_h = 4
@@ -620,5 +854,3 @@ class ZoomableTimeline(tk.Canvas):
 
 
 # ── Edit dialog ────────────────────────────────────────────────────────────────
-
-

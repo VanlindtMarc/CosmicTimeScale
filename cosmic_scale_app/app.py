@@ -16,6 +16,7 @@ from .core.shared import (
     CosmicEvent,
     CosmicPeriod,
     CosmicTag,
+    child_default_color,
     color_variant_for,
     format_duration_seconds,
     format_result,
@@ -200,7 +201,8 @@ class CosmicScaleApp(tk.Tk):
             on_bulk_visibility=self._set_bulk_tag_visibility,
             on_delete_tag=self._delete_tag,
             on_set_color=self._set_tag_color,
-            on_export_group=self._export_group)
+            on_export_group=self._export_group,
+            on_edit_tag=self._edit_tag)
         self._tag_panel.grid(row=9, column=0, sticky="ew")
 
         self._input_panel = EventInputPanel(
@@ -390,12 +392,75 @@ class CosmicScaleApp(tk.Tk):
             return self._ensure_tag_exists("Non-classés")
         return self._ensure_tag_exists(str(raw_name))
 
-    def _tag_names_for_ui(self) -> list[str]:
-        names = [name for name in self._tags.keys() if name != "Non-classés"]
-        names.sort(key=str.lower)
-        return ["Non-classés", *names]
+    # ── Hierarchy helpers ────────────────────────────────────────────────────
 
-    def _create_tag(self, raw_name: str) -> bool:
+    def _tag_ancestors(self, name: str) -> list[str]:
+        """Return [name, parent, grandparent, …] until the root (excluding cycles)."""
+        out, cur, seen = [], name, set()
+        while cur and cur in self._tags and cur not in seen:
+            seen.add(cur)
+            out.append(cur)
+            cur = self._tags[cur].parent_name
+        return out
+
+    def _tag_descendants(self, name: str) -> list[str]:
+        """All descendants of `name` (depth-first, excludes `name` itself)."""
+        out = []
+        children = [n for n, t in self._tags.items() if t.parent_name == name]
+        for c in children:
+            out.append(c)
+            out.extend(self._tag_descendants(c))
+        return out
+
+    def _tag_depth(self, name: str) -> int:
+        return max(0, len(self._tag_ancestors(name)) - 1)
+
+    def _tag_is_effectively_visible(self, name: str) -> bool:
+        """A tag is effectively visible only if it AND every ancestor are."""
+        for anc in self._tag_ancestors(name):
+            t = self._tags.get(anc)
+            if not t: return False
+            if not (t.visible or t.locked_visible):
+                return False
+        return True
+
+    def _sorted_tag_tree(self) -> list[str]:
+        """Names of all tags in tree-traversal order (parents before children),
+        sorted alphabetically at each level."""
+        roots = sorted(
+            (n for n, t in self._tags.items() if not t.parent_name),
+            key=lambda n: (n != "Non-classés", n.lower()))
+
+        def walk(name):
+            yield name
+            children = sorted(
+                (n for n, t in self._tags.items() if t.parent_name == name),
+                key=str.lower)
+            for c in children:
+                yield from walk(c)
+
+        result = []
+        for r in roots:
+            result.extend(walk(r))
+        return result
+
+    def _tag_names_for_ui(self) -> list[str]:
+        """Hierarchical labels: « Parent ▸ Enfant » for the input combo."""
+        labels = []
+        for name in self._sorted_tag_tree():
+            ancestors = self._tag_ancestors(name)[1:]   # skip self
+            if ancestors:
+                prefix = " ▸ ".join(reversed(ancestors)) + " ▸ "
+            else:
+                prefix = ""
+            labels.append(prefix + name)
+        return labels
+
+    def _strip_path(self, label: str) -> str:
+        """Convert a hierarchical label back to its leaf name."""
+        return label.rsplit(" ▸ ", 1)[-1].strip()
+
+    def _create_tag(self, raw_name: str, parent_name: Optional[str] = None) -> bool:
         name = " ".join(raw_name.split())
         if not name:
             return False
@@ -403,7 +468,73 @@ class CosmicScaleApp(tk.Tk):
             messagebox.showinfo("Groupe existant",
                                 f"Le groupe « {name} » existe déjà.")
             return False
-        self._tags[name] = CosmicTag(name=name, color=self._next_group_color())
+        # Parent must exist and not be the locked default group at root level.
+        if parent_name and parent_name in self._tags:
+            base = self._tags[parent_name].color
+            color = child_default_color(base, name)
+        else:
+            parent_name = None
+            color = self._next_group_color()
+        self._tags[name] = CosmicTag(
+            name=name, color=color, parent_name=parent_name)
+        self._refresh()
+        return True
+
+    def _edit_tag(self, old_name: str, raw_name: str,
+                  parent_name: Optional[str] = None) -> bool:
+        tag = self._tags.get(old_name)
+        if tag is None or tag.locked_visible:
+            return False
+
+        new_name = " ".join(str(raw_name or "").split())
+        if not new_name:
+            messagebox.showinfo("Nom invalide",
+                                "Le nom du groupe ne peut pas être vide.",
+                                parent=self)
+            return False
+        if new_name != old_name and new_name in self._tags:
+            messagebox.showinfo("Groupe existant",
+                                f"Le groupe « {new_name} » existe déjà.",
+                                parent=self)
+            return False
+
+        if parent_name and parent_name not in self._tags:
+            parent_name = None
+        if parent_name in (old_name, new_name):
+            messagebox.showinfo("Parent invalide",
+                                "Un groupe ne peut pas être son propre parent.",
+                                parent=self)
+            return False
+        if parent_name in self._tag_descendants(old_name):
+            messagebox.showinfo(
+                "Parent invalide",
+                "Un groupe ne peut pas être déplacé sous l'un de ses sous-groupes.",
+                parent=self)
+            return False
+
+        # Rebuild the dict so the renamed group keeps its relative position
+        # and children/items keep pointing at the renamed group.
+        rebuilt: dict[str, CosmicTag] = {}
+        for name, current in self._tags.items():
+            if name == old_name:
+                current.name = new_name
+                current.parent_name = parent_name
+                rebuilt[new_name] = current
+                continue
+            if current.parent_name == old_name:
+                current.parent_name = new_name
+            rebuilt[name] = current
+        self._tags = rebuilt
+
+        if new_name != old_name:
+            for ev in self._events:
+                if ev.group_name == old_name:
+                    ev.group_name = new_name
+            for per in self._periods:
+                if per.group_name == old_name:
+                    per.group_name = new_name
+
+        self._apply_group_colors()
         self._refresh()
         return True
 
@@ -411,7 +542,22 @@ class CosmicScaleApp(tk.Tk):
         tag = self._tags.get(tag_name)
         if not tag or tag.locked_visible:
             return
-        tag.visible = bool(visible)
+        new_state = bool(visible)
+        tag.visible = new_state
+        # Cascade DOWN: a parent toggle propagates to every descendant.
+        for child_name in self._tag_descendants(tag_name):
+            child = self._tags.get(child_name)
+            if child is not None and not child.locked_visible:
+                child.visible = new_state
+        # Cascade UP only on enable: re-checking a sub-group must also
+        # re-check every ancestor so the cascade-visibility rule actually
+        # makes the items show.  Disabling a sub-group never touches
+        # ancestors (siblings may still need them visible).
+        if new_state:
+            for anc in self._tag_ancestors(tag_name)[1:]:
+                anc_tag = self._tags.get(anc)
+                if anc_tag is not None and not anc_tag.locked_visible:
+                    anc_tag.visible = True
         self._refresh_visibility_only()
 
     def _set_tag_color(self, tag_name: str, color: str):
@@ -436,19 +582,25 @@ class CosmicScaleApp(tk.Tk):
         tag = self._tags.get(tag_name)
         if tag is None or tag.locked_visible:
             return
-        n = sum(1 for ev in self._events  if ev.group_name == tag_name) \
-          + sum(1 for p  in self._periods if p.group_name == tag_name)
-        msg = (f"Supprimer le groupe « {tag_name} » ?\n"
+        # Count items in *this* group plus all descendants for the warning.
+        affected_groups = {tag_name, *self._tag_descendants(tag_name)}
+        n = sum(1 for ev in self._events  if ev.group_name in affected_groups) \
+          + sum(1 for p  in self._periods if p.group_name in affected_groups)
+        sub_count = len(affected_groups) - 1
+        sub_msg = (f"\n{sub_count} sous-groupe(s) seront aussi supprimés."
+                   if sub_count else "")
+        msg = (f"Supprimer le groupe « {tag_name} » ?{sub_msg}\n"
                f"{n} évènement(s) / période(s) seront déplacés vers Non-classés.")
         if not messagebox.askyesno("Supprimer le groupe", msg, parent=self):
             return
         for ev in self._events:
-            if ev.group_name == tag_name:
+            if ev.group_name in affected_groups:
                 ev.group_name = "Non-classés"
         for p in self._periods:
-            if p.group_name == tag_name:
+            if p.group_name in affected_groups:
                 p.group_name = "Non-classés"
-        del self._tags[tag_name]
+        for g in affected_groups:
+            self._tags.pop(g, None)
         self._apply_group_colors()
         self._refresh()
 
@@ -476,13 +628,22 @@ class CosmicScaleApp(tk.Tk):
         self._timeline.set_periods(vp)
         self._tag_panel.refresh_tags(self._tags, self._events, self._periods)
         # Keep the right-pane filter combo in sync with the live group list.
-        self._list_panel.set_group_choices(self._tag_names_for_ui())
+        self._list_panel.set_group_choices(
+            self._tag_names_for_ui(),
+            descendants_map=self._build_descendants_map())
         # If the user is filtering on "Groupes visibles", a visibility change
         # actually changes which items are listed → rebuild the right pane.
         if self._list_filter_mode == "Groupes visibles":
             self._list_panel.refresh_list(self._events, self._periods,
                                             visible_tags)
         self._schedule_autosave()
+
+    def _build_descendants_map(self) -> dict:
+        """Map each group name to the set of itself + all its descendants."""
+        return {
+            name: {name, *self._tag_descendants(name)}
+            for name in self._tags
+        }
 
     def _set_list_filter_mode(self, mode: str):
         """
@@ -493,10 +654,9 @@ class CosmicScaleApp(tk.Tk):
         self._refresh()
 
     def _visible_tag_names(self) -> set[str]:
-        return {
-            name for name, tag in self._tags.items()
-            if tag.visible or tag.locked_visible
-        }
+        """Effective visibility: a tag is visible only if it AND every
+        ancestor in its tree path are visible (or locked)."""
+        return {n for n in self._tags if self._tag_is_effectively_visible(n)}
 
     def _show_drag_indicator(self, label: str, x_root: int, y_root: int,
                              target_tag: Optional[str] = None,
@@ -802,7 +962,9 @@ class CosmicScaleApp(tk.Tk):
         # The panel always receives the FULL lists; it filters internally
         # by the chosen group (or "Tout" = no group filter). Master-list
         # indices stay intact so context-menu actions target the correct item.
-        self._list_panel.set_group_choices(self._tag_names_for_ui())
+        self._list_panel.set_group_choices(
+            self._tag_names_for_ui(),
+            descendants_map=self._build_descendants_map())
         self._list_panel.refresh_list(self._events, self._periods,
                                         visible_tags)
 
@@ -831,10 +993,11 @@ class CosmicScaleApp(tk.Tk):
             "target_scale":          self._tgt_combo.get(),
             "target_custom_seconds": self._tgt_custom.get(),
             "tags": [
-                {"name": tag.name,
-                 "color": tag.color,
-                 "visible": tag.visible,
-                 "locked_visible": tag.locked_visible}
+                {"name":           tag.name,
+                 "color":          tag.color,
+                 "visible":        tag.visible,
+                 "locked_visible": tag.locked_visible,
+                 "parent_name":    tag.parent_name}
                 for tag in self._tags.values()
             ],
             "events": [
@@ -899,11 +1062,13 @@ class CosmicScaleApp(tk.Tk):
                     continue
                 if merge and name in self._tags:
                     continue
+                parent = raw.get("parent_name")
                 self._tags[name] = CosmicTag(
                     name=name,
                     color=str(raw.get("color", self._next_group_color())),
                     visible=bool(raw.get("visible", True)),
-                    locked_visible=bool(raw.get("locked_visible", False)))
+                    locked_visible=bool(raw.get("locked_visible", False)),
+                    parent_name=(str(parent) if parent else None))
             except (KeyError, TypeError, ValueError):
                 continue
         self._ensure_default_tag()
@@ -1073,14 +1238,20 @@ class CosmicScaleApp(tk.Tk):
                 "Groupe vide",
                 f"Le groupe « {group_name} » ne contient ni évènement ni période.")
             return
-        # Build a self-contained payload with the group's tag definition.
-        tag = self._tags[group_name]
+        # Build a self-contained payload — include this tag and any
+        # ancestors needed for the hierarchy to make sense on import.
+        tag_chain = self._tag_ancestors(group_name)
+        tag_defs = []
+        for n in tag_chain:
+            t = self._tags[n]
+            tag_defs.append({
+                "name": t.name, "color": t.color,
+                "visible": t.visible, "locked_visible": t.locked_visible,
+                "parent_name": t.parent_name,
+            })
         payload = {
             "version": 4,
-            "tags": [{
-                "name": tag.name, "color": tag.color,
-                "visible": tag.visible, "locked_visible": tag.locked_visible,
-            }],
+            "tags": tag_defs,
             "events": [
                 {"name": ev.name, "years_ago": ev.years_ago,
                  "absolute_date": ev.absolute_date,
