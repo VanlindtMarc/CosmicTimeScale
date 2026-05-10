@@ -73,6 +73,10 @@ Un clic droit sur un événement ou une période vous permet de :
 
 ![Conflit](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Conflit.png)
 
+## Microsoft
+
+![Microsoft](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/MS1.png)
+
 
 # À venir 
 
