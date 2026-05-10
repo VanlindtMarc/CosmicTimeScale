@@ -81,11 +81,11 @@ Un clic droit sur un événement ou une période vous permet de :
 
 ### Musique classique 
 
-![Classique 1](E:\Logiciels\STARTUPSENDTOMANAGER\Cosmic Time Scale\Classique1.png)
+![Classique 1](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Classique1.png)
 
-![Classique 2](E:\Logiciels\STARTUPSENDTOMANAGER\Cosmic Time Scale\Classique2.png)
+![Classique 2](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Classique2.png)
 
-![Classique 3](E:\Logiciels\STARTUPSENDTOMANAGER\Cosmic Time Scale\Classique3.png)
+![Classique 3](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/Classique3.png)
 
 
 # À venir 
