@@ -49,6 +49,8 @@ Vous pouvez :
 - Définir la période à visualiser
 - Définir l'échelle à laquelle doit être réduite la période visualisée
 
+![Ligne du temps](https://github.com/VanlindtMarc/CosmicTimeScale/blob/main/README/anim1.gif)
+
 ## Colonne de droite : Liste des événements et périodes
 
 Cette colonne vous permet de voir la liste des événements. Par défaut, elle affiche tous les événements mais vous pouvez demander à ne voir que les groupes visibles sur la ligne du temps ou seulement ceux d'un certain groupe.
