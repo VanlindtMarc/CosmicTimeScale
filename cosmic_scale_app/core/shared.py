@@ -45,6 +45,7 @@ SECONDS_PER_DAY    = 86_400
 SECONDS_PER_YEAR   = 365 * SECONDS_PER_DAY
 # Date math uses the Julian year (365.25 d) for accurate "years ago" conversions.
 ASTRO_YEAR_SECONDS = 365.25 * SECONDS_PER_DAY
+SECOND_DISPLAY_DECIMALS = 8
 
 REFERENCE_PERIODS = {
     "Big Bang → aujourd'hui  (13,8 Ga)":              13_800_000_000,
@@ -228,7 +229,7 @@ def format_duration_seconds(s: float) -> str:
     if s >= SECONDS_PER_DAY:     return f"{s / SECONDS_PER_DAY:.2f} j"
     if s >= SECONDS_PER_HOUR:    return f"{s / SECONDS_PER_HOUR:.2f} h"
     if s >= SECONDS_PER_MINUTE:  return f"{s / SECONDS_PER_MINUTE:.2f} min"
-    if s >= 1:                   return f"{s:.2f} s"
+    if s >= 1:                   return f"{s:.{SECOND_DISPLAY_DECIMALS}f} s"
     if s >= 1e-3:                return f"{s * 1000:.2f} ms"
     return f"{s * 1e6:.2f} µs"
 
@@ -330,6 +331,12 @@ def approximate_calendar_year(years_ago: float) -> int:
     return math.floor(now_year_decimal() - years_ago)
 
 
+def format_second_display(seconds: float,
+                          decimals: int = SECOND_DISPLAY_DECIMALS) -> str:
+    width = decimals + 3
+    return f"{seconds:0{width}.{decimals}f}"
+
+
 def format_real_date_label(years_ago: float, step_sec: Optional[float] = None) -> str:
     dt = years_ago_to_datetime(years_ago)
     if dt is None:
@@ -342,7 +349,7 @@ def format_real_date_label(years_ago: float, step_sec: Optional[float] = None) -
     if step_sec is None:
         sec = dt.second + dt.microsecond / 1_000_000
         return (f"Le {dt.day} {MONTH_NAMES_FULL[dt.month - 1]} {dt.year}\n"
-                f"a {dt.hour:02d}h {dt.minute:02d}min {sec:05.2f}s")
+                f"a {dt.hour:02d}h {dt.minute:02d}min {format_second_display(sec)}s")
     if step_sec >= 5 * ASTRO_YEAR_SECONDS:
         return str(dt.year)
     if step_sec >= 30 * SECONDS_PER_DAY:
@@ -356,7 +363,7 @@ def format_real_date_label(years_ago: float, step_sec: Optional[float] = None) -
     if step_sec >= 1:
         return f"{short_date}\n{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
     sec = dt.second + dt.microsecond / 1_000_000
-    return f"{short_date}\n{dt.hour:02d}:{dt.minute:02d}:{sec:06.3f}"
+    return f"{short_date}\n{dt.hour:02d}:{dt.minute:02d}:{format_second_display(sec)}"
 
 
 def fraction_to_position(frac: float, target_seconds: float) -> dict:
@@ -406,7 +413,7 @@ def format_result(pos: dict, target_seconds: float,
     # ── 1-year scale ──────────────────────────────────────────────────────────
     if abs(target_seconds - SECONDS_PER_YEAR) < 0.5:
         return (f"Le {pos['day_of_month']} {pos['month_name']}\n"
-                f"à {pos['hour']:02d}h {pos['minute']:02d}min {pos['second']:05.2f}s\n"
+                f"à {pos['hour']:02d}h {pos['minute']:02d}min {format_second_display(pos['second'])}s\n"
                 f"(jour {pos['day_of_year']} · {pct:.4f}%)")
 
     # ── 1-day scale ───────────────────────────────────────────────────────────
@@ -414,13 +421,13 @@ def format_result(pos: dict, target_seconds: float,
         ts = pos["fraction"] * SECONDS_PER_DAY
         h  = int(ts // SECONDS_PER_HOUR);   ts -= h * SECONDS_PER_HOUR
         m  = int(ts // SECONDS_PER_MINUTE); sc = ts - m * SECONDS_PER_MINUTE
-        return f"{h:02d}h {m:02d}min {sc:05.2f}s\n({pct:.4f}%)"
+        return f"{h:02d}h {m:02d}min {format_second_display(sc)}s\n({pct:.4f}%)"
 
     # ── 1-hour scale ──────────────────────────────────────────────────────────
     if abs(target_seconds - SECONDS_PER_HOUR) < 0.5:
         ts = pos["fraction"] * SECONDS_PER_HOUR
         m  = int(ts // SECONDS_PER_MINUTE); sc = ts - m * SECONDS_PER_MINUTE
-        return f"{m}min {sc:05.2f}s\n({pct:.4f}%)"
+        return f"{m}min {format_second_display(sc)}s\n({pct:.4f}%)"
 
     # ── Multi-year scales (siècle, millénaire, custom) ────────────────────────
     if target_seconds >= 1.5 * SECONDS_PER_YEAR:
@@ -432,7 +439,7 @@ def format_result(pos: dict, target_seconds: float,
         m   = int(rem // SECONDS_PER_MINUTE); sc = rem - m * SECONDS_PER_MINUTE
         mi, dm = _month_day_from_day_of_year(min(d, 364))
         return (f"An {yr+1}, le {dm+1} {MONTH_NAMES_FULL[mi]}\n"
-                f"à {h:02d}h {m:02d}min {sc:05.2f}s\n"
+                f"à {h:02d}h {m:02d}min {format_second_display(sc)}s\n"
                 f"(jour {d+1} de l'année · {pct:.4f}%)")
 
     # ── Generic fallback ──────────────────────────────────────────────────────
@@ -440,7 +447,7 @@ def format_result(pos: dict, target_seconds: float,
     days = int(ts // SECONDS_PER_DAY);  ts -= days * SECONDS_PER_DAY
     h    = int(ts // SECONDS_PER_HOUR); ts -= h * SECONDS_PER_HOUR
     m    = int(ts // SECONDS_PER_MINUTE); sc = ts - m * SECONDS_PER_MINUTE
-    return f"Jour {days+1}  ·  {h:02d}h {m:02d}min {sc:05.2f}s\n({pct:.4f}%)"
+    return f"Jour {days+1}  ·  {h:02d}h {m:02d}min {format_second_display(sc)}s\n({pct:.4f}%)"
 
 
 # Tick steps in seconds, sorted ascending. Used to pick a "nice" interval at
@@ -500,7 +507,7 @@ def _format_axis_overflow_label(offset_seconds: float, step_sec: float) -> str:
         minutes = int(s // SECONDS_PER_MINUTE)
         seconds = int(s - minutes * SECONDS_PER_MINUTE)
         return f"{sign}{minutes}:{seconds:02d}"
-    return f"{sign}{s:.3f}s"
+    return f"{sign}{format_second_display(s)}s"
 
 
 def format_axis_label(seconds: float, target_seconds: float, step_sec: float,
@@ -527,7 +534,7 @@ def format_axis_label(seconds: float, target_seconds: float, step_sec: float,
         if step_sec >= SECONDS_PER_HOUR:   return f"{date}\n{h:02d}h"
         if step_sec >= 60:                 return f"{date}\n{h:02d}:{m:02d}"
         if step_sec >= 1:                  return f"{date}\n{h:02d}:{m:02d}:{int(sc):02d}"
-        return f"{date}\n{h:02d}:{m:02d}:{sc:06.3f}"
+        return f"{date}\n{h:02d}:{m:02d}:{format_second_display(sc)}"
 
     # ── 1-day scale ───────────────────────────────────────────────────────────
     if abs(target_seconds - SECONDS_PER_DAY) < 0.5:
@@ -536,14 +543,14 @@ def format_axis_label(seconds: float, target_seconds: float, step_sec: float,
         if step_sec >= SECONDS_PER_HOUR: return f"{h:02d}h"
         if step_sec >= 60:               return f"{h:02d}:{m:02d}"
         if step_sec >= 1:                return f"{h:02d}:{m:02d}:{int(sc):02d}"
-        return f"{h:02d}:{m:02d}:{sc:06.3f}"
+        return f"{h:02d}:{m:02d}:{format_second_display(sc)}"
 
     # ── 1-hour scale ──────────────────────────────────────────────────────────
     if abs(target_seconds - SECONDS_PER_HOUR) < 0.5:
         m  = int(seconds // 60); sc = seconds - m * 60
         if step_sec >= 60: return f"{m}min"
         if step_sec >= 1:  return f"{m}min{int(sc):02d}s"
-        return f"{m}min{sc:06.3f}s"
+        return f"{m}min{format_second_display(sc)}s"
 
     # ── Multi-year scales (century, millennium, custom multi-year) ────────────
     if target_seconds >= 1.5 * SECONDS_PER_YEAR:
@@ -557,11 +564,12 @@ def format_axis_label(seconds: float, target_seconds: float, step_sec: float,
         if step_sec >= SECONDS_PER_YEAR: return f"An {yr+1}"
         if step_sec >= SECONDS_PER_DAY:  return f"An {yr+1}\n{dm+1} {MONTH_NAMES[mi]}"
         if step_sec >= 60:               return f"An {yr+1}\n{dm+1}{MONTH_NAMES[mi]} {h:02d}:{m:02d}"
-        return f"An {yr+1}\n{dm+1}{MONTH_NAMES[mi]} {h:02d}:{m:02d}:{int(sc):02d}"
+        if step_sec >= 1:               return f"An {yr+1}\n{dm+1}{MONTH_NAMES[mi]} {h:02d}:{m:02d}:{int(sc):02d}"
+        return f"An {yr+1}\n{dm+1}{MONTH_NAMES[mi]} {h:02d}:{m:02d}:{format_second_display(sc)}"
 
     # ── Generic fallback ──────────────────────────────────────────────────────
     if step_sec >= 1:    return f"{seconds:,.0f}s"
-    return f"{seconds:,.3f}s"
+    return f"{format_second_display(seconds)}s"
 
 
 # ── Zoomable Timeline ──────────────────────────────────────────────────────────

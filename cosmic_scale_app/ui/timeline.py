@@ -12,12 +12,15 @@ from ..core.shared import (
     SECONDS_PER_HOUR,
     SECONDS_PER_MINUTE,
     SECONDS_PER_YEAR,
+    contrast_text_color,
     format_axis_label,
     format_calendar_year,
     format_real_date_label,
     now_year_decimal,
     pick_tick_step,
+    relative_luminance,
     session_now,
+    shade_color,
 )
 class ZoomableTimeline(tk.Canvas):
     # 1e12 lets us drill down to ~30 microseconds on a 1-year target — far below
@@ -274,6 +277,15 @@ class ZoomableTimeline(tk.Canvas):
         self._period_scroll_y = self._period_scroll_drag["start_scroll"] + dy * ratio
         self._clamp_period_scroll()
         self._redraw()
+
+    def _period_style(self, base_color: str) -> tuple[str, str, str]:
+        try:
+            lum = relative_luminance(base_color)
+            outline = shade_color(base_color, -0.45 if lum > 0.45 else 0.55)
+            text = contrast_text_color(base_color)
+            return base_color, outline, text
+        except Exception:
+            return PALETTE["accent"], PALETTE["border"], PALETTE["text"]
 
     def _on_motion(self, event):
         # Period hits take priority over events when the cursor is below the
@@ -796,15 +808,17 @@ class ZoomableTimeline(tk.Canvas):
             # Cache hit-test rectangle for tooltip on hover.
             self._period_hits.append((p, x0, cy0, x1, cy1))
 
-            # Hatched fill block, solid colored border.
+            fill_color, outline_color, text_color = self._period_style(p.color)
+
+            # Solid period block with a contrast-adjusted border.
             self.create_rectangle(x0, cy0, x1, cy1,
-                                   fill=p.color, outline=p.color, width=1,
-                                   stipple="gray25")
+                                   fill=fill_color, outline=outline_color,
+                                   width=1)
             # End-cap markers: vertical bars at start & end (clipped to view).
             if xs >= -2:
-                self.create_line(xs, cy0, xs, cy1, fill=p.color, width=2)
+                self.create_line(xs, cy0, xs, cy1, fill=outline_color, width=2)
             if xe <= period_right + 2:
-                self.create_line(xe, cy0, xe, cy1, fill=p.color, width=2)
+                self.create_line(xe, cy0, xe, cy1, fill=outline_color, width=2)
 
             block_w = x1 - x0
             suffix  = "  ·  en cours" if getattr(p, "is_ongoing", False) \
@@ -813,17 +827,17 @@ class ZoomableTimeline(tk.Canvas):
             label_y = (cy0 + cy1) // 2
             if cy1 - cy0 >= 12 and block_w >= 90:
                 self.create_text((x0 + x1) // 2, label_y,
-                                  text=label, fill=PALETTE["text"],
+                                  text=label, fill=text_color,
                                   font=("Segoe UI", 8, "bold"))
             elif cy1 - cy0 >= 12 and block_w >= 36:
                 self.create_text((x0 + x1) // 2, label_y,
-                                  text=p.name[:14], fill=PALETTE["text"],
+                                  text=p.name[:14], fill=text_color,
                                   font=("Segoe UI", 7, "bold"))
             # When block is too narrow to hold any label, draw it just to the right.
             elif cy1 - cy0 >= 12 and xe < period_right:
                 self.create_text(xe + 4, label_y,
                                   text=label, anchor="w",
-                                  fill=p.color, font=("Segoe UI", 7))
+                                  fill=outline_color, font=("Segoe UI", 7))
 
         if max_scroll > 0 and thumb_rect is not None:
             self.create_rectangle(track_rect[0], track_rect[1],
