@@ -123,6 +123,7 @@ Un clic droit sur un événement ou une période vous permet de :
 - Zoom auto avec début de période à cette date
 
 - Dans la description : indiquer à quel groupe cet événement ou période est rattaché
+- Dans la section du bas, soit voir tous les groupes mélangés soit un tri par groupe
 
 
 
